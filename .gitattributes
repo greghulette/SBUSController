@@ -6,3 +6,4 @@ LocalConfigs/*.json -text
 # corrupt the flashed image). The web flasher downloads these verbatim.
 *.bin binary
 *.pdf binary
+*.png binary
