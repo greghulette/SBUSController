@@ -1475,7 +1475,7 @@ function updateFwVersion() {
 // page the token is never replaced, so we fall back to "dev". Compare this
 // (latest build) against the header's FW version (what's on the board) to see
 // whether the board needs a flash.
-const UI_VERSION = '25.12:52.R.JUN.2026';
+const UI_VERSION = '25.12:57.R.JUN.2026';
 function initFooterVersion() {
   const el = document.getElementById('footer-ui-version');
   if (el) el.textContent = UI_VERSION.startsWith('__') ? 'dev' : UI_VERSION;
