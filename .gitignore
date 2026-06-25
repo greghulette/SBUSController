@@ -11,3 +11,7 @@
 Thumbs.db
 desktop.ini
 /LocalConfigs
+
+# Generated at build time by tools/build-firmware.sh (FW_VERSION stamp).
+# Not committed — a build without it falls back to FW_VERSION "dev".
+fw_version.h

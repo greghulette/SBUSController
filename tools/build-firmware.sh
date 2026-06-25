@@ -61,6 +61,13 @@ echo ""
 rm -rf "$BUILD_DIR"
 mkdir -p "$FW_DIR"
 
+# ── Stamp the build tag into fw_version.h so the firmware reports its version ─
+# SBUSController.ino #includes this (via __has_include) and exposes FW_VERSION
+# to the UI. The file is .gitignored (generated, never committed); a plain
+# Arduino IDE build with no file falls back to "dev".
+printf '#define FW_VERSION "%s"\n' "$TAG" > "$REPO_ROOT/fw_version.h"
+echo "→ stamped fw_version.h: FW_VERSION=\"$TAG\""
+
 echo "→ arduino-cli compile  (this can take a minute)…"
 arduino-cli compile \
   --fqbn "$FQBN" \

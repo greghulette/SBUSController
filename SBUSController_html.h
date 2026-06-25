@@ -441,6 +441,9 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
     <!-- Transport picker — click to switch between WiFi and USB Serial. The
          current transport is reflected in the button label. -->
     <button class="hdr-btn" id="transportBtn" onclick="toggleTransportMenu(event)">WiFi ▾</button>
+    <!-- Firmware version reported by the connected board (cfg.fwver). Shows the
+         build tag so you can see updates take effect after a flash. -->
+    <span id="fwVersion" title="Firmware version on the connected board" style="font-size:.6rem;font-weight:600;letter-spacing:.04em;color:var(--muted);font-family:monospace;">FW —</span>
     <div id="connBadge">DISCONNECTED</div>
   </div>
 </header>
@@ -517,6 +520,7 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   <text x="668" y="89" fill="#7acdf6" font-size="10" font-family="monospace" text-anchor="end" id="tx-screen-status">—</text>
   <text x="332" y="112" fill="#5a9ac6" font-size="10" font-family="monospace" id="tx-screen-mode">Mode: SBUS-24</text>
   <text x="668" y="112" fill="#5a9ac6" font-size="10" font-family="monospace" text-anchor="end" id="tx-screen-frames">Frames: 0</text>
+  <text x="332" y="132" fill="#3a6a9a" font-size="9" font-family="monospace" id="tx-screen-fw">FW: —</text>
 
   <!-- LUA button grid mirrored from the HTML row above (5 cols × 3 rows).
        Populated by renderScreenLuaButtons() once the cfg arrives. -->
@@ -1253,6 +1257,7 @@ class SerialTransport extends Transport {
     this.port     = null;
     this.reader   = null;
     this.writer   = null;
+    this._readableClosed = null;   // pipeTo(port.readable→decoder) promise; awaited on close()
     this.pingTimer = null;
     this.connected = false;
     this._closing  = false;
@@ -1277,8 +1282,14 @@ class SerialTransport extends Transport {
       this.writer = this.port.writable.getWriter();
 
       // Reader: byte stream → TextDecoder → string chunks → our line buffer.
+      // Keep the pipeTo promise: it holds the lock on port.readable for the
+      // life of the pipe, and close() MUST await it (after cancelling the
+      // reader) before port.close(), or port.close() races the still-locked
+      // stream and rejects with "port is already open" — leaving the port open
+      // and breaking the esptool handoff. This is the documented Web Serial
+      // teardown pattern (web.dev/serial).
       const decoder = new TextDecoderStream();
-      this.port.readable.pipeTo(decoder.writable).catch(() => {});
+      this._readableClosed = this.port.readable.pipeTo(decoder.writable).catch(() => {});
       this.reader = decoder.readable.getReader();
 
       this.connected = true;
@@ -1302,10 +1313,15 @@ class SerialTransport extends Transport {
       console.error('[SerialTransport] open failed:', err);
       this.connected = false;
       this.onstate(false);
-      // Tidy up half-opened state if any.
+      // Tidy up half-opened state if any (release the readable pipe lock first,
+      // same ordering as close(), so port.close() doesn't race a locked stream).
+      try { this.reader && await this.reader.cancel(); } catch (_) {}
+      try { if (this._readableClosed) await this._readableClosed; } catch (_) {}
       try { this.writer && this.writer.releaseLock(); } catch (_) {}
       try { this.port   && await this.port.close();   } catch (_) {}
+      this.reader = null;
       this.writer = null;
+      this._readableClosed = null;
       this.port   = null;
       // When reusing a caller-supplied port (post-flash auto-reconnect), RETHROW
       // so reopenAfterFlash's catch can refresh the stale SerialPort handle after
@@ -1350,11 +1366,16 @@ class SerialTransport extends Transport {
   async close() {
     this._closing = true;
     if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+    // Order matters: cancel the reader, then AWAIT the pipe unwinding so
+    // port.readable's lock is released, THEN release the writer and close the
+    // port. Skipping the pipe-await leaves the port open (see open() comment).
     try { this.reader && await this.reader.cancel(); } catch (_) {}
+    try { if (this._readableClosed) await this._readableClosed; } catch (_) {}
     try { this.writer && this.writer.releaseLock();  } catch (_) {}
     try { this.port   && await this.port.close();    } catch (_) {}
     this.reader = null;
     this.writer = null;
+    this._readableClosed = null;
     this.port   = null;
     this.connected = false;
     this._closing  = false;
@@ -1389,7 +1410,18 @@ function handleInboundMessage(msg) {
 let _lastPongMs = 0;   // updated on every PONG — used by post-flash reconnect liveness check
 function handlePong(msg) {
   _lastPongMs = Date.now();
-  console.log('[transport] PONG  ver=' + msg.ver);
+  if (msg.fwver != null) { cfg.fwver = msg.fwver; updateFwVersion(); }
+  console.log('[transport] PONG  ver=' + msg.ver + '  fw=' + (msg.fwver || '?'));
+}
+
+// Show the connected board's firmware version in the header chip + TX screen.
+// "—" when unknown (disconnected / pre-handshake).
+function updateFwVersion() {
+  const v = (cfg && cfg.fwver) ? cfg.fwver : '—';
+  const chip = document.getElementById('fwVersion');
+  if (chip) chip.textContent = 'FW ' + v;
+  const scr = document.getElementById('tx-screen-fw');
+  if (scr) scr.textContent = 'FW: ' + v;
 }
 
 // Heuristic: are we being served by the ESP itself?  If yes the WebSocket
@@ -2182,6 +2214,7 @@ function setBadge(on) {
   const b = document.getElementById('connBadge');
   b.textContent = on ? 'CONNECTED' : 'DISCONNECTED';
   b.className   = on ? 'connected' : '';
+  if (!on) { cfg.fwver = null; updateFwVersion(); }   // clear stale version when disconnected
 }
 
 // =============================================================================
@@ -2189,6 +2222,7 @@ function setBadge(on) {
 // =============================================================================
 function applyCfg(msg) {
   if (msg.ver != null) cfg.ver = msg.ver;   // stamp exports with the firmware's cfg version
+  if (msg.fwver != null) { cfg.fwver = msg.fwver; updateFwVersion(); }
   cfg.rx     = msg.rx    || 1;
   cfg.ry     = msg.ry    || 2;
   cfg.ly     = msg.ly    || 3;
