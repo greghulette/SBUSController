@@ -17,20 +17,25 @@ be anything — the flasher picks the newest by suffix):
 | `WCB_S3_custom_bootloader_16MB_wdt3s.bin` | `0x0` | custom short-WDT bootloader — **fixed, already committed** |
 
 - The **app** image is required. The **bootloader + partition table** are a
-  pair: commit both or neither. (Both are committed here once; you only update
-  the app + part each build — though re-committing an unchanged part is fine.)
+  pair: commit both or neither.
 - The bootloader is the **custom short-watchdog 16 MB** build (cold-boot
   auto-retry) — the matched pair of the firmware's in-app boot guard. Do **not**
   replace it with the stock Arduino IDE bootloader. It's kept under a fixed name
   so a stray stock `*_boot.bin` can never shadow it.
 
-## Building the app + partition binaries
+## These are auto-built — you normally don't touch them
 
-Build the sketch for the SBUSController board options
-(`USBMode=hwcdc, CDCOnBoot=cdc, PartitionScheme=min_spiffs`, 16 MB), then drop
-the compiled `*_ESP32S3.bin` and `*_ESP32S3_part.bin` here and commit. Use
-whatever export flow you already use for NaviCore / RC-Controller (e.g.
-ESP-Flasher-Companion or `arduino-cli compile --output-dir`).
+`.github/workflows/build-firmware.yml` compiles the sketch on every push that
+changes `*.ino` / `*.h` and commits the fresh `*_ESP32S3.bin` +
+`*_ESP32S3_part.bin` here (`Auto-build: update firmware binaries [skip ci]`).
+The flasher then serves the latest build automatically.
+
+The CI also commits a **stock** `*_ESP32S3_boot.bin` for completeness — the
+flasher ignores it and always uses the fixed custom bootloader above.
+
+To build locally instead (macOS/Linux/WSL): run `tools/build-firmware.sh`. On
+Windows, use the Arduino IDE / ESP-Flasher-Companion with the board options
+`USBMode=hwcdc, CDCOnBoot=cdc, PartitionScheme=min_spiffs` (16 MB).
 
 ## Flash modes (in the config tool)
 

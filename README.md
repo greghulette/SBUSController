@@ -35,10 +35,13 @@ Serial, Chrome/Edge) that flashes the ESP32-S3 with [esptool-js](https://github.
 If you're already connected over USB Serial it reuses the same port (no second
 picker) and auto-reconnects after the board reboots.
 
-Binaries are pulled from [`firmware/`](firmware) on this repo — see
-[firmware/README.md](firmware/README.md) for what to build and commit. The
-custom short-WDT bootloader is already committed; you add the app + partition
-binaries each build.
+Binaries are pulled from [`firmware/`](firmware) on this repo. A GitHub Action
+([`.github/workflows/build-firmware.yml`](.github/workflows/build-firmware.yml))
+**auto-builds** the app + partition images on every push that changes the sketch
+(`.ino`/`.h`) and commits them back to `firmware/` — so the hosted flasher always
+serves the latest firmware with no manual build step. The custom short-WDT
+bootloader is committed once (fixed name) and left untouched by CI. See
+[firmware/README.md](firmware/README.md) for the layout.
 
 > Flashing needs USB Serial. It is unavailable on the ESP-served WiFi page (the
 > board doesn't serve `flasher.js`, and esptool needs a direct serial port) —
