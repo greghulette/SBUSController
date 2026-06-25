@@ -40,6 +40,14 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Sync GitHub Pages copy from SBUSController_html.h
+        # SBUSController_html.h is the single source of truth (embedded in the
+        # firmware). docs/index.html is its generated GitHub Pages mirror.
+        # Regenerate it here so a push that edits the .h keeps the hosted page
+        # in sync automatically — no manual `python sync_html.py` step. If the
+        # .h didn't change the HTML body, this is a no-op (nothing to commit).
+        run: python3 sync_html.py
+
       - name: Install Arduino CLI
         run: |
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=/usr/local/bin sh
@@ -77,11 +85,13 @@ jobs:
           chmod +x tools/build-firmware.sh
           tools/build-firmware.sh
 
-      - name: Commit binaries
-        # "[skip ci]" prevents this auto-commit from re-triggering the workflow.
+      - name: Commit binaries + synced Pages copy
+        # Commits the freshly-built firmware bins AND the regenerated
+        # docs/index.html (only the ones that actually changed). "[skip ci]"
+        # prevents this auto-commit from re-triggering the workflow.
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Auto-build: update firmware binaries [skip ci]"
-          file_pattern: "firmware/*.bin"
+          commit_message: "Auto-build: firmware binaries + synced Pages UI [skip ci]"
+          file_pattern: "firmware/*.bin docs/index.html"
           commit_user_name:  "github-actions[bot]"
           commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
