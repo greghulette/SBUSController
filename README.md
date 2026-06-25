@@ -23,6 +23,27 @@ USB Serial** button in the header.
   a known network. Uses the [Web Serial API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API);
   no install, no server.
 
+## Flashing firmware from the browser
+
+The config tool has a **Firmware** section (visible on the hosted page over USB
+Serial, Chrome/Edge) that flashes the ESP32-S3 with [esptool-js](https://github.com/espressif/esptool-js)
+— no Arduino IDE needed for updates.
+
+- **Update** — writes new firmware, keeps your saved config.
+- **Full Wipe & Flash** — also erases saved config (factory-fresh / recovery).
+
+If you're already connected over USB Serial it reuses the same port (no second
+picker) and auto-reconnects after the board reboots.
+
+Binaries are pulled from [`firmware/`](firmware) on this repo — see
+[firmware/README.md](firmware/README.md) for what to build and commit. The
+custom short-WDT bootloader is already committed; you add the app + partition
+binaries each build.
+
+> Flashing needs USB Serial. It is unavailable on the ESP-served WiFi page (the
+> board doesn't serve `flasher.js`, and esptool needs a direct serial port) —
+> use the hosted page over USB.
+
 ## Hardware
 
 Target: **ESP32-S3** on a WCB HW 3.2 board.

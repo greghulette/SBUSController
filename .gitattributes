@@ -1,3 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
-/LocalConfigs/ *.json
+LocalConfigs/*.json -text
+
+# Firmware images are binary — never apply text/EOL normalization (it would
+# corrupt the flashed image). The web flasher downloads these verbatim.
+*.bin binary
+*.pdf binary

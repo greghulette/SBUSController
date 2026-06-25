@@ -312,6 +312,13 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
     border-radius:0 0 10px 10px;padding:14px;display:flex;flex-direction:column;gap:14px;
   }
   .sec-title{font-size:.62rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:4px;}
+  .fw-btn{font-size:.74rem;font-weight:700;letter-spacing:.04em;padding:7px 14px;border-radius:7px;
+    cursor:pointer;background:var(--panel);border:1px solid var(--border);color:var(--text);
+    transition:all .15s;user-select:none;}
+  .fw-btn:hover:not(:disabled){border-color:var(--accent);}
+  .fw-btn-update{border-color:var(--green);color:var(--green);}
+  .fw-btn-wipe{border-color:var(--red);color:var(--red);}
+  .fw-btn:disabled{opacity:.4;cursor:not-allowed;}
   .cfg-table{width:100%;border-collapse:collapse;font-size:.74rem;}
   .cfg-table th{font-size:.6rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
     color:var(--muted);padding:4px 6px;text-align:left;border-bottom:1px solid var(--border);}
@@ -1091,6 +1098,40 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   </details>
 </div>
 
+<!-- ── Firmware flash (USB Serial only) ─────────────────────────────────────────
+     Hidden by default; revealed by JS only when flasher.js loaded (i.e. the page
+     is served from GitHub Pages / a local file, not from the ESP's own web
+     server — the ESP doesn't serve flasher.js, and flashing needs USB anyway). -->
+<div class="settings-wrap" id="fwWrap" style="display:none;">
+  <details id="fwDetails">
+    <summary>Firmware</summary>
+    <div class="settings-body">
+      <div style="font-size:.74rem;color:var(--muted);margin-bottom:10px;line-height:1.5;">
+        Flash the ESP32-S3 over USB — Chrome/Edge only. <b style="color:var(--text)">Update</b>
+        writes new firmware and keeps your saved config; <b style="color:var(--text)">Full Wipe</b>
+        also erases saved config (factory-fresh / recovery). If you're connected over USB Serial
+        the same port is reused — no second port picker.
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <button id="btn-fw-flash" class="fw-btn fw-btn-update"
+          title="Writes new firmware while preserving your saved config (NVS).">&#x2B06; Update Firmware</button>
+        <button id="btn-fw-wipe" class="fw-btn fw-btn-wipe"
+          title="Erases EVERYTHING — bootloader, partitions, app, and saved config. First-time programming or recovery.">&#x26A0; Full Wipe &amp; Flash</button>
+        <span id="fw-status" style="font-size:.72rem;color:var(--muted);">Idle.</span>
+      </div>
+      <div id="fw-progress-wrap" style="display:none;margin-top:10px;height:14px;background:var(--bg);border:1px solid var(--border);border-radius:7px;overflow:hidden;position:relative;">
+        <div id="fw-progress-bar" style="height:100%;width:0%;background:var(--accent);transition:width .2s;"></div>
+        <span id="fw-progress-pct" style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:.62rem;line-height:14px;color:var(--text);">0%</span>
+      </div>
+      <pre id="fw-log" style="display:none;margin-top:10px;max-height:200px;overflow-y:auto;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:.66rem;line-height:1.4;color:var(--muted);white-space:pre-wrap;word-break:break-word;"></pre>
+    </div>
+  </details>
+</div>
+
+<!-- esptool-js web flasher (Pages / local file only; the ESP doesn't serve this
+     file, so on the WiFi-hosted page window.flashFirmware stays undefined and
+     the Firmware section above stays hidden). -->
+<script src="flasher.js"></script>
 <script>
 // =============================================================================
 //  Constants & state
@@ -1217,7 +1258,11 @@ class SerialTransport extends Transport {
     this._closing  = false;
   }
 
-  async open() {
+  // existingPort: an already-granted SerialPort to reuse WITHOUT the picker
+  // (used by the post-flash auto-reconnect, where the port was just handed to
+  // esptool and is already authorized).  Omit it for the normal Connect flow,
+  // which shows the picker.
+  async open(existingPort = null) {
     if (!navigator.serial) {
       alert('USB Serial requires a Chromium-based browser (Chrome, Edge, etc.)\n' +
             'In Safari or Firefox, use the WiFi connection instead.');
@@ -1225,7 +1270,7 @@ class SerialTransport extends Transport {
       return;
     }
     try {
-      this.port = await navigator.serial.requestPort();   // user picks COM port
+      this.port = existingPort || await navigator.serial.requestPort();   // reuse, or user picks COM port
       await this.port.open({ baudRate: 115200 });
 
       // Writer: utf8-encode JSON + newline into the port's WritableStream.
@@ -1262,6 +1307,13 @@ class SerialTransport extends Transport {
       try { this.port   && await this.port.close();   } catch (_) {}
       this.writer = null;
       this.port   = null;
+      // When reusing a caller-supplied port (post-flash auto-reconnect), RETHROW
+      // so reopenAfterFlash's catch can refresh the stale SerialPort handle after
+      // the board's native-USB CDC re-enumerates.  Without this, that retry loop
+      // is dead code — every cycle silently no-ops on the same invalidated handle
+      // and auto-reconnect always gives up.  The normal Connect flow passes no
+      // existingPort, so it still swallows the error (picker-cancel etc.).
+      if (existingPort) throw err;
     }
   }
 
@@ -1334,7 +1386,9 @@ function handleInboundMessage(msg) {
 // PONG receipt = the firmware is alive and speaks our cfg version.  We don't
 // currently surface this to the UI beyond logging, but it's the hook for
 // later (e.g. compatibility check, latency display).
+let _lastPongMs = 0;   // updated on every PONG — used by post-flash reconnect liveness check
 function handlePong(msg) {
+  _lastPongMs = Date.now();
   console.log('[transport] PONG  ver=' + msg.ver);
 }
 
@@ -1400,6 +1454,7 @@ document.addEventListener('click', (ev) => {
 // changes so the badge tracks the new connection.
 async function chooseTransport(kind) {
   document.getElementById('transportMenu').classList.remove('show');
+  if (_fwFlashing) return;   // never switch the port out from under an in-progress flash
   // Skip if user picked the already-active kind — avoids a pointless reset.
   const currentKind = (transport instanceof SerialTransport) ? 'serial' : 'wifi';
   if (kind === currentKind && transport.isConnected()) return;
@@ -1420,6 +1475,169 @@ async function chooseTransport(kind) {
 function _updateTransportBtn() {
   const btn = document.getElementById('transportBtn');
   if (btn && transport) btn.textContent = transport.label + ' ▾';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Firmware flashing  (USB Serial · Chrome/Edge · wraps flashFirmware() from
+//  flasher.js).  Active only when flasher.js loaded — i.e. the hosted page
+//  (GitHub Pages / local file).  On the ESP-served WiFi page flasher.js isn't
+//  served, so window.flashFirmware stays undefined and the Firmware section
+//  stays hidden (flashing needs USB anyway).
+// ═══════════════════════════════════════════════════════════════════════════
+let _fwFlashing = false;
+const _fwSleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Resolve once a PONG arrives (its timestamp advances past `before`), else false.
+async function _fwWaitForPong(before, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (_lastPongMs > before) return true;
+    await _fwSleep(100);
+  }
+  return false;
+}
+
+// Reopen a just-flashed port and resume the USB-Serial session WITHOUT a picker.
+// The board reboots on flash completion; on native USB CDC it re-enumerates, so
+// open() can fail — or land on a half-up endpoint that never answers — for a
+// second or two.  Retry across that window, confirming a REAL session by
+// waiting for a PONG (an opened-but-dead port never sends one).
+async function reopenAfterFlash(p) {
+  await _fwSleep(3000);   // board boot + native-USB re-enumeration
+  for (let cycle = 0; cycle < 6; cycle++) {
+    try {
+      const t = new SerialTransport();
+      t.onmessage = handleInboundMessage;
+      t.onstate   = setBadge;
+      transport = t;
+      _updateTransportBtn();
+      const before = _lastPongMs;
+      await t.open(p);                          // reuse the granted port, no picker
+      if (await _fwWaitForPong(before, 1500)) return true;   // board answered
+      await t.close();                          // opened but dead — tear down, retry
+    } catch (_) {
+      try { await p.close(); } catch (_) {}
+      try { const g = await navigator.serial.getPorts(); if (g.length) p = g[g.length - 1]; } catch (_) {}
+    }
+    await _fwSleep(500);
+  }
+  transport = null; setBadge(false);
+  return false;
+}
+
+async function runFirmwareFlash({ eraseNvs, sourceBtn, label, defaultLabel }) {
+  if (_fwFlashing) return;
+  if (typeof window.flashFirmware !== 'function') {
+    alert('Firmware flasher not loaded. Open the hosted tool (GitHub Pages) over USB to flash.');
+    return;
+  }
+  _fwFlashing = true;
+
+  const btnFlash = document.getElementById('btn-fw-flash');
+  const btnWipe  = document.getElementById('btn-fw-wipe');
+  const btnTrans = document.getElementById('transportBtn');
+  const statusEl = document.getElementById('fw-status');
+  const wrap     = document.getElementById('fw-progress-wrap');
+  const bar      = document.getElementById('fw-progress-bar');
+  const pctEl    = document.getElementById('fw-progress-pct');
+  const logEl    = document.getElementById('fw-log');
+
+  const setStatus = m => { statusEl.textContent = m; };
+  const setBar = (w, t) => {
+    const p = t > 0 ? Math.min(100, Math.round(w * 100 / t)) : 0;
+    bar.style.width = p + '%'; pctEl.textContent = p + '%';
+  };
+  const appendLog = m => { logEl.textContent += m + '\n'; logEl.scrollTop = logEl.scrollHeight; };
+
+  logEl.textContent = ''; logEl.style.display = 'block';
+  wrap.style.display = 'block'; setBar(0, 1);
+  btnFlash.disabled = true; btnWipe.disabled = true;
+  if (btnTrans) btnTrans.disabled = true;     // block transport switch mid-flash
+  sourceBtn.textContent = label;
+  appendLog(eraseNvs ? '⚠ Full wipe mode — NVS and OTA data will be erased.'
+                     : 'Update mode — NVS preserved.');
+
+  let flashPort   = null;
+  let resumeAfter = false;
+  try {
+    if (transport instanceof SerialTransport && transport.port) {
+      // Reuse the port we're already connected through — no second picker.
+      appendLog('Reusing the connected USB port (no need to pick it again)…');
+      flashPort   = transport.port;
+      resumeAfter = true;
+      await transport.close();
+    } else {
+      // Not connected over serial.  Prefer an already-granted port; only show
+      // the picker if none / ambiguous.
+      if (transport) { try { await transport.close(); } catch (_) {} }
+      let granted = [];
+      try { granted = await navigator.serial.getPorts(); } catch (_) {}
+      if (granted.length === 1) {
+        flashPort = granted[0];
+        appendLog('Using the previously-authorized USB port…');
+      } else {
+        setStatus('Selecting USB port…');
+        appendLog('Requesting USB serial port (pick the SBUS Controller / WCB)…');
+        try { flashPort = await navigator.serial.requestPort(); }
+        catch (e) { throw new Error('No port selected — flashing cancelled.'); }
+      }
+    }
+
+    // esptool-js opens the port itself; hand it a CLOSED port.  A warm-up
+    // open+close satisfies esptool-js's expectation that it was opened once.
+    try { await flashPort.open({ baudRate: 115200 }); await flashPort.close(); } catch (_) {}
+
+    await window.flashFirmware(flashPort, {
+      onProgress: setBar, onLog: appendLog, onStatus: setStatus, eraseNvs,
+    });
+
+    setBar(1, 1);
+    appendLog('');
+    appendLog(eraseNvs
+      ? 'Full wipe complete. Board is factory-fresh — saved config erased.'
+      : 'Update complete. Your saved config was preserved.');
+
+    if (resumeAfter) {
+      setStatus('Reconnecting…'); appendLog('Reconnecting to the board…');
+      const ok = await reopenAfterFlash(flashPort);
+      setStatus(ok ? 'Flash complete — reconnected.' : 'Flash complete — click USB Serial to resume.');
+      appendLog(ok ? 'Reconnected — config session resumed.'
+                   : 'Auto-reconnect timed out — use the transport button → USB Serial to resume.');
+    } else {
+      setStatus('Flash complete.');
+      appendLog('Connect over USB Serial to start a config session.');
+    }
+  } catch (e) {
+    console.error(e);
+    setStatus('Flash failed.');
+    appendLog(''); appendLog('✖ ' + (e?.message || String(e)));
+  } finally {
+    // Close flashPort only if we didn't resume a live session on it.
+    if (flashPort && !(transport instanceof SerialTransport && transport.port === flashPort)) {
+      try { await flashPort.close(); } catch (_) {}
+    }
+    btnFlash.disabled = false; btnWipe.disabled = false;
+    if (btnTrans) btnTrans.disabled = false;
+    _fwFlashing = false;
+    sourceBtn.textContent = defaultLabel;
+  }
+}
+
+// Reveal the Firmware section + wire its buttons — only when flasher.js loaded.
+function initFirmwarePanel() {
+  if (typeof window.flashFirmware !== 'function') return;   // ESP-served page → stay hidden
+  const wrap = document.getElementById('fwWrap');
+  if (wrap) wrap.style.display = '';
+  const btnFlash = document.getElementById('btn-fw-flash');
+  const btnWipe  = document.getElementById('btn-fw-wipe');
+  if (btnFlash) btnFlash.addEventListener('click', e =>
+    runFirmwareFlash({ eraseNvs:false, sourceBtn:e.currentTarget, label:'Updating…', defaultLabel:'⬆ Update Firmware' }));
+  if (btnWipe) btnWipe.addEventListener('click', e => {
+    const ok = window.confirm('Full Wipe & Flash will ERASE all saved settings on the board (NVS) ' +
+      'and write a factory-fresh firmware image.\n\nContinue?');
+    if (!ok) return;
+    runFirmwareFlash({ eraseNvs:true, sourceBtn:e.currentTarget, label:'Wiping…', defaultLabel:'⚠ Full Wipe & Flash' });
+  });
 }
 
 // ─── SVG transmitter handlers (Phase 1) ───────────────────────────────────
@@ -3104,6 +3322,7 @@ initSvgSwitchPositions();
 wireSvgSwitchHandlers();   // strip static inline handlers, rewire to type-aware dispatcher
 initSvgAnalogs();
 applyUnitToggle();   // pick up persisted unit preference on first paint
+initFirmwarePanel(); // reveal + wire the Firmware section iff flasher.js loaded
 connect();
 </script>
 </body>

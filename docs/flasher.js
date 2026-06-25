@@ -1,0 +1,317 @@
+// ════════════════════════════════════════════════════════════════
+//  SBUS Controller Firmware Flasher
+//
+//  Browser-based ESP32-S3 flasher for the WCB v3.2 hardware variant.
+//  Adapted from the NaviCore / Wireless_Communication_Board-WCB Wizard
+//  flasher — SAME upstream library, SAME flash addresses, SAME custom
+//  short-WDT bootloader and NVS-preservation logic — retargeted at the
+//  SBUSController repo's /firmware/ folder.
+//
+//  Uses esptool-js (Espressif's official browser flash library) loaded
+//  on-demand from CDN, plus CryptoJS for MD5 verification.
+//
+//  Firmware binaries are hosted in the SBUSController repo under
+//  /firmware/ on GitHub.  The Contents API lists the directory so a
+//  freshly built binary with a versioned filename (e.g.
+//  SBUSController_201500RMAY26_ESP32S3.bin) is picked up automatically —
+//  only the suffix needs to be stable.
+//
+//  Public surface:
+//    flashFirmware(port, callbacks)  → Promise<void>
+//
+//  port is a WebSerial SerialPort that MUST be closed before calling.
+// ════════════════════════════════════════════════════════════════
+
+const ESPTOOL_CDN  = 'https://cdn.jsdelivr.net/npm/esptool-js@0.4.7/+esm';
+const CRYPTOJS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js';
+
+// ── Firmware source config ───────────────────────────────────────
+// Binaries live in /firmware/ on GitHub with versioned names ending
+// in one of three stable suffixes:
+//   _ESP32S3.bin       — application image           → 0x10000
+//   _ESP32S3_part.bin  — partition table             → 0x8000
+//   WCB_S3_custom_bootloader_16MB_wdt3s.bin (FIXED)   → 0x0
+//
+// Only the application image is required.  Bootloader + partition are a
+// PAIR — both or neither (see fetchFirmwareImages for the rationale).
+const GITHUB_OWNER          = 'greghulette';
+const GITHUB_REPO           = 'SBUSController';
+const GITHUB_BRANCH_DEFAULT = 'main';
+const GITHUB_BIN_PATH       = 'firmware';
+
+// Branch override (Advanced/dev only) — set via localStorage to test
+// unreleased branches without recompiling the page.
+function getFirmwareBranch() {
+  try {
+    const b = (localStorage.getItem('sbus_fw_branch') || '').trim();
+    return b || GITHUB_BRANCH_DEFAULT;
+  } catch (_) {
+    return GITHUB_BRANCH_DEFAULT;
+  }
+}
+
+// ── Script loader ────────────────────────────────────────────────
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
+    const s    = document.createElement('script');
+    s.src      = src;
+    s.onload   = resolve;
+    s.onerror  = () => reject(new Error(`Failed to load CDN script: ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+// ── Binary fetching ──────────────────────────────────────────────
+// Returns [{ buf, address }, ...] in ascending-address order.
+//
+// Flash map (ESP32-S3, min_spiffs partition scheme):
+//   boot   → 0x0       (bootloader)
+//   part   → 0x8000    (partition table)
+//   nvs    → 0x9000    (NVS — NOT touched here so saved config survives)
+//   ota_0  → 0x10000   (application)
+async function fetchFirmwareImages(onLog) {
+  const branch = getFirmwareBranch();
+  const apiUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_BIN_PATH}?ref=${branch}`;
+
+  if (branch !== GITHUB_BRANCH_DEFAULT)
+    onLog(`⚠ Firmware source branch: ${branch} (not the released 'main')`);
+  onLog(`Scanning ${GITHUB_BIN_PATH}/ on GitHub (${branch})…`);
+
+  const listResp = await fetch(apiUrl);
+  if (!listResp.ok) {
+    if (listResp.status === 404)
+      throw new Error(`No ${GITHUB_BIN_PATH}/ folder on GitHub (${GITHUB_OWNER}/${GITHUB_REPO}@${branch}). ` +
+        `Build the firmware and commit the .bin files there first.`);
+    if (listResp.status === 403)
+      throw new Error(`GitHub API rate limit hit (HTTP 403). Wait a few minutes and retry.`);
+    throw new Error(`GitHub API: HTTP ${listResp.status}`);
+  }
+  const files = await listResp.json();
+  if (!Array.isArray(files))
+    throw new Error(`Unexpected GitHub API response for ${GITHUB_BIN_PATH}/.`);
+
+  async function fetchBySuffix(suffix, required) {
+    const match = files.find(f => f.type === 'file' && f.name.endsWith(suffix));
+    if (!match) {
+      if (required) throw new Error(`No file ending with "${suffix}" found in ${GITHUB_BIN_PATH}/`);
+      return null;
+    }
+    onLog(`Found: ${match.name}`);
+    const r = await fetch(match.download_url);
+    if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${match.name}`);
+    const buf = await r.arrayBuffer();
+    if (buf.byteLength === 0) throw new Error(`${match.name} is empty`);
+    return buf;
+  }
+
+  // App is required; boot + part are optional (paired — either both or neither).
+  const appBuf = await fetchBySuffix('_ESP32S3.bin', true);
+  const images = [{ buf: appBuf, address: 0x10000 }];
+
+  // Bootloader + partition table are a PAIR — flash both or neither. Fetch each
+  // as optional (non-throwing) and inspect them independently:
+  //   • both present  → full flash (boot + part + app)
+  //   • both absent   → app-only (fine for re-flashing an already-provisioned
+  //                     board; a blank board still needs a one-time IDE flash)
+  //   • exactly one   → a corrupted/partial firmware upload. Do NOT silently
+  //                     fall back to app-only: app-only onto a blank board (no
+  //                     partition table) leaves it unbootable. Abort loudly.
+  // Bootloader = the CUSTOM short-WDT 16MB bootloader (cold-boot auto-retry),
+  // committed under a FIXED name so a stock per-build *_boot.bin can never
+  // shadow it. It is the matched pair of the firmware's in-app boot guard.
+  // Partition table stays the tagged per-build _ESP32S3_part.bin.
+  const [bootBuf, partBuf] = await Promise.all([
+    fetchBySuffix('WCB_S3_custom_bootloader_16MB_wdt3s.bin', false),
+    fetchBySuffix('_ESP32S3_part.bin', false),
+  ]);
+  let hasBootPart = false;
+  if (bootBuf && partBuf) {
+    images.unshift(
+      { buf: bootBuf, address: 0x0    },
+      { buf: partBuf, address: 0x8000 },
+    );
+    hasBootPart = true;
+  } else if (bootBuf || partBuf) {
+    const missing = bootBuf ? 'partition table (_ESP32S3_part.bin)'
+                            : 'custom bootloader (WCB_S3_custom_bootloader_16MB_wdt3s.bin)';
+    throw new Error(`Incomplete firmware on GitHub: the ${missing} is missing while ` +
+      `its pair is present. Refusing to flash a partial set — app-only onto a blank ` +
+      `board would leave it unbootable. Re-run the firmware build/upload, then retry.`);
+  } else {
+    onLog('Note: bootloader/partition files not on GitHub — flashing app only.');
+    onLog('      A blank board will need a one-time full flash via Arduino IDE.');
+  }
+
+  const totalKB = Math.round(images.reduce((s, i) => s + i.buf.byteLength, 0) / 1024);
+  onLog(`Loaded ${totalKB} KB (${hasBootPart ? 'boot + partitions + app' : 'app only'})`);
+  return images;
+}
+
+// ── Buffer → Latin1 string (esptool-js wants strings, not Uint8Array) ─
+function bufToLatin1(buf) {
+  const u8 = new Uint8Array(buf);
+  let s = '';
+  const CHUNK = 65536;
+  for (let i = 0; i < u8.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+  }
+  return s;
+}
+
+// Windows detection — CP210x driver has a known issue with mid-flash
+// baud-rate changes, so we keep 115200 there.  Mac/Linux can use 460800.
+const _isWindowsPlatform = /Win/i.test(navigator.platform || '');
+
+// ════════════════════════════════════════════════════════════════
+//  flashFirmware
+//
+//  port      — WebSerial SerialPort, MUST be CLOSED before calling
+//  options   — {
+//                onProgress(written, total),
+//                onLog(msg),
+//                onStatus(msg),
+//                eraseNvs  : bool   — true → full wipe (factory state)
+//              }
+//
+//  Always writes bootloader + partition table + app (they're tiny and
+//  identical across builds, and reading flash first to decide is slow and
+//  flaky over the S3 native USB — see Step 3b).  The only difference
+//  between Update and Full Wipe is whether NVS (0x9000) + otadata (0xE000)
+//  are also erased.  Update preserves NVS so saved config survives.
+// ════════════════════════════════════════════════════════════════
+async function flashFirmware(port, { onProgress, onLog, onStatus, eraseNvs = false }) {
+
+  // ── Step 1: load CDN dependencies ──────────────────────────────
+  onStatus('Loading flash tool…');
+  onLog('Loading CryptoJS…');
+  try { await loadScript(CRYPTOJS_CDN); }
+  catch (e) { throw new Error(`Could not load CryptoJS from CDN — are you online?\n${e.message}`); }
+
+  onLog('Loading esptool-js…');
+  let ESPLoader, Transport;
+  try { ({ ESPLoader, Transport } = await import(ESPTOOL_CDN)); }
+  catch (e) { throw new Error(`Could not load esptool-js from CDN — are you online?\n${e.message}`); }
+  onLog('Flash tool loaded.');
+
+  // ── Step 2: fetch firmware ──────────────────────────────────────
+  onStatus('Downloading firmware…');
+  let flashImages;
+  try { flashImages = await fetchFirmwareImages(onLog); }
+  catch (e) { throw new Error(`Firmware download failed: ${e.message}`); }
+
+  // ── Step 3: connect to ESP bootloader ──────────────────────────
+  onStatus('Connecting to bootloader…');
+  onLog('Connecting to ESP32-S3 bootloader…');
+  onLog('► If sync fails: hold BOOT, tap RST, release BOOT — then click Flash again.');
+
+  // Route esptool-js internal messages into our log so the user can see sync progress.
+  const terminal = {
+    clean:     ()    => {},
+    writeLine: (msg) => { if (msg?.trim()) onLog(`[esptool] ${msg.trim()}`); },
+    write:     (msg) => { if (msg?.trim()) onLog(`[esptool] ${msg.trim()}`); },
+  };
+
+  const transport = new Transport(port, false);
+  const loader    = new ESPLoader({
+    transport,
+    baudrate:    _isWindowsPlatform ? 115200 : 460800,
+    romBaudrate: 115200,
+    enableTracing: false,
+    terminal,
+  });
+
+  let chip;
+  try {
+    chip = await loader.main();
+    onLog(`Chip identified: ${chip}`);
+  } catch (e) {
+    try { await transport.disconnect(); } catch (_) {}
+    throw new Error(
+      `Bootloader connection failed: ${e.message}\n\n` +
+      `To enter bootloader mode: hold BOOT, press RST, release BOOT, then click Flash again.`
+    );
+  }
+
+  // ── Step 3b: decide what to flash ──────────────────────────────
+  // We DELIBERATELY do not read the flash to choose app-only vs. full.
+  // readFlash() over the ESP32-S3 native USB is slow and flaky, and when it
+  // stalls it wedges the esptool stub so the SUBSEQUENT write times out.
+  // Instead: ALWAYS write bootloader + partition table + app. They're tiny
+  // next to the ~1 MB app and identical on every build, so always writing
+  // them is reliable on BOTH blank and already-programmed boards.
+  let imagesToFlash = flashImages.slice();
+  onLog(eraseNvs
+    ? 'Full wipe — flashing bootloader + partitions + app (NVS will be erased).'
+    : 'Update — flashing bootloader + partitions + app (NVS preserved).');
+
+  // ── Step 3c: optionally prepend NVS + otadata erase images ────
+  // Partition layout (PartitionScheme=min_spiffs):
+  //   nvs     @ 0x9000,  size 0x5000 (20 KB)
+  //   otadata @ 0xE000,  size 0x2000  (8 KB — two 4 KB flash sectors)
+  //   ota_0   @ 0x10000
+  // Writing 0xFF buffers erases+rewrites those sectors to factory-fresh.
+  // BOTH otadata sectors MUST be erased: a stale OTA pointer to ota_1 would
+  // make the bootloader boot a non-existent ota_1 → OTA-rollback reboot loop.
+  if (eraseNvs) {
+    const nvsBlank     = new ArrayBuffer(0x5000);  // NVS: 20 KB @ 0x9000
+    const otadataBlank = new ArrayBuffer(0x2000);  // otadata: 8 KB @ 0xE000
+    new Uint8Array(nvsBlank).fill(0xFF);
+    new Uint8Array(otadataBlank).fill(0xFF);
+    imagesToFlash = [
+      { buf: nvsBlank,     address: 0x9000 },
+      { buf: otadataBlank, address: 0xE000 },
+      ...imagesToFlash,
+    ];
+    onLog('NVS (0x9000, 20 KB) and OTA data (0xE000, 8 KB) will be erased.');
+  }
+
+  const totalBytes = imagesToFlash.reduce((sum, img) => sum + img.buf.byteLength, 0);
+
+  // ── Step 4: write flash ────────────────────────────────────────
+  onStatus(`Flashing ${chip}…`);
+  onLog(`Writing ${Math.round(totalBytes / 1024)} KB across ${imagesToFlash.length} region(s)…`);
+  onProgress(0, totalBytes);
+
+  const writeFlashFn = loader.writeFlash ?? loader.write_flash;
+  if (typeof writeFlashFn !== 'function') {
+    try { await transport.disconnect(); } catch (_) {}
+    throw new Error('esptool-js: writeFlash method not found — unexpected library version.');
+  }
+
+  let bytesWritten = 0;
+  try {
+    await writeFlashFn.call(loader, {
+      fileArray: imagesToFlash.map(img => ({ data: bufToLatin1(img.buf), address: img.address })),
+      flashSize: 'keep',
+      flashMode: 'keep',
+      flashFreq: 'keep',
+      eraseAll:  false,
+      compress:  true,
+      reportProgress: (_fileIdx, written, total) => {
+        onProgress(bytesWritten + written, totalBytes);
+        if (written === total) bytesWritten += total;
+      },
+      calculateMD5Hash: (img) =>
+        CryptoJS.MD5(CryptoJS.enc.Latin1.parse(img)).toString(),
+    });
+  } catch (e) {
+    try { await transport.disconnect(); } catch (_) {}
+    throw new Error(`Flash write failed: ${e.message}`);
+  }
+
+  // ── Step 5: reset into firmware ────────────────────────────────
+  onLog('Resetting board into firmware…');
+  onStatus('Resetting…');
+  onProgress(totalBytes, totalBytes);
+
+  const afterFlashFn = loader.afterFlash ?? loader.after_flash;
+  try { if (afterFlashFn) await afterFlashFn.call(loader, 'hard_reset'); } catch (_) {}
+  try { await transport.disconnect(); }                                   catch (_) {}
+
+  onLog('Flash complete — board rebooting.');
+  onStatus('Flash complete!');
+}
+
+// Expose globally so the page's inline JS can call it without a module loader.
+window.flashFirmware = flashFirmware;
