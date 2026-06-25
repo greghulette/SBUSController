@@ -323,5 +323,26 @@ async function flashFirmware(port, { onProgress, onLog, onStatus, eraseNvs = fal
   onStatus('Flash complete!');
 }
 
-// Expose globally so the page's inline JS can call it without a module loader.
-window.flashFirmware = flashFirmware;
+// ── Latest-version lookup ────────────────────────────────────────
+// Lightweight: lists firmware/ on GitHub (no bin download) and returns the
+// build tag embedded in the app image's filename
+// (SBUSController_<TAG>_ESP32S3.bin → <TAG>), which is the SAME string the
+// firmware reports as FW_VERSION. The Firmware panel compares it against the
+// connected board's running version to flag "update available".
+async function fetchLatestFwTag() {
+  const branch = getFirmwareBranch();
+  const apiUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_BIN_PATH}?ref=${branch}`;
+  const resp = await fetch(apiUrl);
+  if (!resp.ok) throw new Error(`GitHub API HTTP ${resp.status}`);
+  const files = await resp.json();
+  if (!Array.isArray(files)) throw new Error('Unexpected GitHub API response');
+  const app = files.find(f => f.type === 'file' && f.name.endsWith('_ESP32S3.bin'));
+  if (!app) throw new Error('No app image in firmware/');
+  let tag = app.name;
+  if (tag.startsWith('SBUSController_')) tag = tag.slice('SBUSController_'.length);
+  return tag.replace(/_ESP32S3\.bin$/, '');
+}
+
+// Expose globally so the page's inline JS can call these without a module loader.
+window.flashFirmware    = flashFirmware;
+window.fetchLatestFwTag = fetchLatestFwTag;

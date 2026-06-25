@@ -319,6 +319,9 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   .fw-btn-update{border-color:var(--green);color:var(--green);}
   .fw-btn-wipe{border-color:var(--red);color:var(--red);}
   .fw-btn:disabled{opacity:.4;cursor:not-allowed;}
+  /* Pulsing accent on the Update button when a newer build is on GitHub. */
+  .fw-btn.fw-update-avail{border-color:var(--accent);color:var(--accent);animation:fwPulse 1.6s ease-in-out infinite;}
+  @keyframes fwPulse{0%,100%{box-shadow:0 0 0 0 rgba(79,195,247,0);}50%{box-shadow:0 0 0 3px rgba(79,195,247,.25);}}
   .cfg-table{width:100%;border-collapse:collapse;font-size:.74rem;}
   .cfg-table th{font-size:.6rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
     color:var(--muted);padding:4px 6px;text-align:left;border-bottom:1px solid var(--border);}
@@ -1107,7 +1110,7 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
      is served from GitHub Pages / a local file, not from the ESP's own web
      server — the ESP doesn't serve flasher.js, and flashing needs USB anyway). -->
 <div class="settings-wrap" id="fwWrap" style="display:none;">
-  <details id="fwDetails">
+  <details id="fwDetails" ontoggle="if(this.open) checkFirmwareVersion(false);">
     <summary>Firmware</summary>
     <div class="settings-body">
       <div style="font-size:.74rem;color:var(--muted);margin-bottom:10px;line-height:1.5;">
@@ -1115,6 +1118,14 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
         writes new firmware and keeps your saved config; <b style="color:var(--text)">Full Wipe</b>
         also erases saved config (factory-fresh / recovery). If you're connected over USB Serial
         the same port is reused — no second port picker.
+      </div>
+      <!-- Version check: running (from the board) vs latest on GitHub. -->
+      <div id="fw-version-status" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;font-size:.72rem;font-family:monospace;background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:8px 12px;margin-bottom:10px;">
+        <span style="color:var(--muted);">Running <b id="fw-running" style="color:var(--text);">—</b></span>
+        <span style="color:var(--muted);">Latest <b id="fw-latest" style="color:var(--text);">—</b></span>
+        <span id="fw-update-badge" style="font-weight:700;"></span>
+        <button onclick="checkFirmwareVersion(true)" title="Re-check GitHub for the latest build"
+                style="margin-left:auto;background:none;border:1px solid var(--border);border-radius:5px;color:var(--muted);font-size:.66rem;padding:3px 8px;cursor:pointer;">↻ Recheck</button>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
         <button id="btn-fw-flash" class="fw-btn fw-btn-update"
@@ -1473,6 +1484,48 @@ function updateFwVersion() {
   if (chip) chip.textContent = 'FW ' + v;
   const scr = document.getElementById('tx-screen-fw');
   if (scr) scr.textContent = 'FW: ' + v;
+  // Refresh the Firmware-panel running-vs-latest comparison without re-hitting
+  // GitHub (reuses the cached latest tag) — so after a flash+reconnect the
+  // badge flips to "Up to date" on its own.
+  checkFirmwareVersion(false);
+}
+
+// ── Firmware version check (running on board vs latest on GitHub) ───────────
+// running = cfg.fwver (reported by the board); latest = the tag in the app
+// image's filename on GitHub (fetchLatestFwTag from flasher.js). Same format,
+// so a plain string compare flags "update available". forceFetch re-hits the
+// GitHub API; otherwise the cached latest tag is reused.
+let _fwLatestTag = null;
+async function checkFirmwareVersion(forceFetch) {
+  const runEl = document.getElementById('fw-running');
+  const latEl = document.getElementById('fw-latest');
+  const badge = document.getElementById('fw-update-badge');
+  const btn   = document.getElementById('btn-fw-flash');
+  if (!runEl || !latEl || !badge) return;   // panel not present (ESP-served page)
+
+  const connected = !!(transport && transport.isConnected && transport.isConnected());
+  const running   = (cfg && cfg.fwver) ? cfg.fwver : null;
+  // running unknown can mean two things: not connected, or connected to a board
+  // whose firmware predates the fwver field (a build to flash away).
+  runEl.textContent = running || (connected ? 'unknown (pre-version build)' : '— (connect over USB)');
+
+  // Latest on GitHub — only fetch when forced or not yet cached.
+  if ((forceFetch || !_fwLatestTag) && typeof window.fetchLatestFwTag === 'function') {
+    latEl.textContent = 'checking…';
+    try { _fwLatestTag = await window.fetchLatestFwTag(); }
+    catch (e) { _fwLatestTag = null; latEl.textContent = 'unavailable'; }
+  }
+  if (_fwLatestTag) latEl.textContent = _fwLatestTag;
+
+  const mark = (txt, color, pulse) => {
+    badge.textContent = txt; badge.style.color = color;
+    if (btn) btn.classList.toggle('fw-update-avail', !!pulse);
+  };
+  if (!_fwLatestTag)                       mark('', '', false);                          // can't compare
+  else if (running && running === _fwLatestTag) mark('✓ Up to date',      'var(--green)',  false);
+  else if (running)                        mark('⬆ Update available', 'var(--accent)', true);   // different build
+  else if (connected)                      mark('⬆ Update available', 'var(--accent)', true);   // pre-version fw
+  else                                     mark('', '', false);                          // not connected
 }
 
 // UI build version, shown in the footer. sync_html.py (run by CI on every push
