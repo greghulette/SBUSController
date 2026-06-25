@@ -61,6 +61,21 @@
 #include "esp_ota_ops.h"        // esp_ota_get_bootloader_description (boot banner)
 #include "rom/rtc.h"            // rtc_get_reset_reason (low-level boot telemetry)
 
+// ─── Firmware version ─────────────────────────────────────────────────────────
+// CI (tools/build-firmware.sh) writes fw_version.h with the build tag
+// (<UTC date>-<short sha>) before compiling, so every web-flashed build reports
+// a unique version. fw_version.h is .gitignored (generated, never committed);
+// a plain Arduino IDE build with no such file falls back to "dev". The version
+// is sent to the UI in buildCfgJson() and shown in the page header / TX screen.
+#if defined(__has_include)
+#  if __has_include("fw_version.h")
+#    include "fw_version.h"
+#  endif
+#endif
+#ifndef FW_VERSION
+#  define FW_VERSION "dev"
+#endif
+
 // ─── WiFi ─────────────────────────────────────────────────────────────────────
 #define MAX_WIFI_NETS       8    // CLI digit cap is '0'..'8' — keep ≤ 9 so single-char input still works
 #define WIFI_AP_SSID        "SBUSCtrl"
@@ -633,6 +648,7 @@ String buildCfgJson() {
   JsonDocument doc;
   doc["e"]      = "cfg";
   doc["ver"]    = CFG_VER;
+  doc["fwver"]  = FW_VERSION;   // firmware build tag — shown in the UI
   doc["rx"]     = cfg.joyRX;
   doc["ry"]     = cfg.joyRY;
   doc["ly"]     = cfg.joyLY;
@@ -996,7 +1012,9 @@ void processCommandJson(const char* json) {
     g_serialHostLastSeenMs = millis();
     String resp = "{\"t\":\"pong\",\"ver\":";
     resp += CFG_VER;
-    resp += "}";
+    resp += ",\"fwver\":\"";
+    resp += FW_VERSION;
+    resp += "\"}";
     // Reply only over Serial — WS clients use the WebSocket open event for
     // the same purpose, so echoing PONGs to all WS clients would be noise.
     // Routed through the outbox so it can never interleave into the middle
@@ -1563,6 +1581,7 @@ void setup() {
   g_serialJsonBuf.reserve(MAX_JSON_LINE);
   delay(400);
   Serial.println("\n[SBUS] SBUSController booting (X18 edition)...");
+  Serial.printf("[SBUS] Firmware: %s\n", FW_VERSION);
   printBootloaderInfo();
   printBootTelemetry();
 
