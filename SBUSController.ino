@@ -144,7 +144,7 @@ bool g_serialDebug = false;   // verbose serial dump — off by default; toggle 
 #define MAX_SLIDERS   7    // LS RS S1 S2 + X20 additions (MS middle slider, J5/J6 stick twist axes)
 #define MAX_TRIMS     6    // T1-T6
 #define MAX_BUTTONS   8    // S1-S6  + X20 additions (L-Stick Click / R-Stick Click — matrix momentary buttons that come with the 3-axis gimbal upgrade)
-#define MAX_LUA_BTNS  15   // configurable Lua / virtual buttons
+#define MAX_LUA_BTNS  45   // configurable Lua / virtual buttons (3 pages of 15; Kyberpad import)
 
 enum SwType : uint8_t { SW_3POS=0, SW_2POS=1, SW_MOMENT=2 };
 
@@ -967,7 +967,7 @@ void switchWifi(uint8_t pref);
 // buffer before any data arrives.
 static String  g_serialJsonBuf;
 static bool    g_serialInJson      = false;
-static const   size_t MAX_JSON_LINE = 6144;   // cfg payload ≈ 5 KB; headroom for growth
+static const   size_t MAX_JSON_LINE = 12288;  // cfg payload with 45 Lua buttons ≈ 7 KB; headroom for growth
 
 // ── Serial host liveness ────────────────────────────────────────────────────
 // When a JSON-aware host (Web Serial client / config tool) sends us a {t:"ping"}
@@ -1559,11 +1559,11 @@ void setup() {
   // whole message at once and loop()'s 9 ms SBUS cadence is never stalled.
   // Must precede begin().
   Serial.setTxBufferSize(4096);
-  // RX buffer big enough to absorb a full config payload (~5 KB import)
-  // arriving faster than loop() can drain byte-by-byte.  Default is ~256 B
-  // which would silently drop bytes mid-stream and corrupt the JSON.
-  // Must precede begin().
-  Serial.setRxBufferSize(4096);
+  // RX buffer big enough to absorb a full config payload arriving faster than
+  // loop() can drain byte-by-byte. With 45 Lua buttons a full cfg import is
+  // ~7 KB, so 12 KB gives comfortable headroom (default ~256 B would silently
+  // drop bytes mid-stream and corrupt the JSON). Must precede begin().
+  Serial.setRxBufferSize(12288);
   Serial.begin(115200);
 #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
   // This build routes Serial to the native USB CDC (Tools → USB CDC On Boot:

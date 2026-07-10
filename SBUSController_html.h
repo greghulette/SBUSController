@@ -259,7 +259,9 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 
   .lua-section{width:100%;max-width:960px;}
   .lua-header{margin-bottom:6px;}
-  .lua-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;}
+  /* 45 buttons — cap the height so the grid doesn't dominate the page; scroll
+     for the rest (roughly 3 pages of 15 visible in the scroll area). */
+  .lua-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;max-height:340px;overflow-y:auto;padding-right:4px;}
   @media(max-width:600px){.lua-grid{grid-template-columns:repeat(3,1fr);}}
   .lua-btn{
     --btn-color: #4fc3f7;
@@ -460,10 +462,25 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 
 <!-- ── Lua / virtual buttons — top of page for easy access ─────────────────── -->
 <div class="lua-section" id="luaSection">
-  <div class="lua-header">
+  <div class="lua-header" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
     <span style="font-size:.62rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);">Lua Buttons</span>
+    <button onclick="document.getElementById('kyberpadFile').click()" title="Import a Kyberpad config .txt to set button labels, colors, and values"
+            style="font-size:.62rem;font-weight:600;letter-spacing:.04em;padding:4px 10px;border-radius:6px;cursor:pointer;background:var(--panel);border:1px solid var(--border);color:var(--accent);">⬇ Import Kyberpad file</button>
+    <input type="file" id="kyberpadFile" accept=".txt,text/plain" style="display:none" onchange="onKyberpadFile(this)">
+    <span id="kyberpadStatus" style="font-size:.66rem;color:var(--muted);"></span>
+    <span style="font-size:.6rem;color:var(--muted);margin-left:auto;">…or drop the file anywhere on this page</span>
   </div>
   <div class="lua-grid" id="luaGrid"></div>
+</div>
+
+<!-- Full-page drop overlay for Kyberpad file import (shown on dragover). -->
+<div id="kyberpadDrop" style="display:none;position:fixed;inset:0;z-index:400;background:rgba(13,15,20,.85);
+     align-items:center;justify-content:center;pointer-events:none;">
+  <div style="border:2px dashed var(--accent);border-radius:14px;padding:40px 56px;color:var(--accent);
+       font-size:1.1rem;font-weight:700;letter-spacing:.05em;text-align:center;background:var(--panel);">
+    ⬇ Drop Kyberpad config to import<br>
+    <span style="font-size:.7rem;font-weight:400;color:var(--muted);">sets the 45 Lua button labels, colors &amp; values</span>
+  </div>
 </div>
 
 <!-- ── Transmitter SVG (X18 visualisation, Phase 1) ────────────────────────── -->
@@ -1048,11 +1065,13 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
       </div>
 
       <div>
-        <div class="sec-title">Lua Buttons (15 virtual)</div>
-        <table class="cfg-table">
-          <thead><tr><th>#</th><th>Label</th><th>Channel</th><th>Pressed Value</th><th>Color</th></tr></thead>
-          <tbody id="luaCfgBody"></tbody>
-        </table>
+        <div class="sec-title">Lua Buttons (45 virtual · 3 pages of 15)</div>
+        <div style="max-height:360px;overflow-y:auto;">
+          <table class="cfg-table">
+            <thead><tr><th>#</th><th>Label</th><th>Channel</th><th>Pressed Value</th><th>Color</th></tr></thead>
+            <tbody id="luaCfgBody"></tbody>
+          </table>
+        </div>
       </div>
 
       <div>
@@ -1237,7 +1256,7 @@ let cfg = {
   sl:  Array.from({length:4},  (_,i)=>({l:['LS','RS','S1','S2'][i]||`SL${i}`, c:0, pct:50})),
   tr:  Array.from({length:6},  (_,i)=>({l:`T${i+1}`, c:0, s:10, cur:992})),
   btn: Array.from({length:6},  (_,i)=>({l:`Btn${i+1}`, c:0, v:1811})),
-  lua: Array.from({length:15}, (_,i)=>({l:`Button ${i+1}`, c:0, v:1811}))
+  lua: Array.from({length:45}, (_,i)=>({l:`Button ${i+1}`, c:0, v:1811}))
 };
 let g_dbgOn = false;
 
@@ -2367,7 +2386,7 @@ function applyCfg(msg) {
   if (Array.isArray(msg.lua)) {
     cfg.lua = msg.lua;
   } else if (!cfg.lua) {
-    cfg.lua = Array.from({length:15}, (_,i)=>({l:`Button ${i+1}`,c:0,v:1811,k:'#4fc3f7'}));
+    cfg.lua = Array.from({length:45}, (_,i)=>({l:`Button ${i+1}`,c:0,v:1811,k:'#4fc3f7'}));
   }
   // PWM outputs
   if (Array.isArray(msg.pwm)) cfg.pwm = msg.pwm;
@@ -2452,7 +2471,7 @@ function renderAll() {
   renderPots();         // S1/S2 in pot row above sticks (hidden — SVG is the real UI)
   renderTrimBank();     // all 6 trims in a row below sticks (hidden — SVG)
   renderButtons();      // physical S1-S6 (hidden — SVG); RB1/RB2 → switches SI/SJ
-  renderLuaButtons();        // 15 configurable virtual buttons (HTML row above)
+  renderLuaButtons();        // 45 configurable virtual buttons (HTML row above)
   renderScreenLuaButtons();  // same buttons mirrored inside the SVG screen pod
   renderSettings();
 }
@@ -2818,7 +2837,7 @@ function renderButtons() {
   }
 }
 
-// ── Lua / virtual button grid (15 buttons) ───────────────────────────────────
+// ── Lua / virtual button grid (45 buttons) ───────────────────────────────────
 function renderLuaButtons() {
   const grid = document.getElementById('luaGrid');
   grid.innerHTML = '';
@@ -2841,6 +2860,115 @@ function renderLuaButtons() {
     grid.appendChild(el);
   });
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Kyberpad import — drop (or pick) a Kyberpad config .txt to set the 45 Lua
+//  buttons. INI-style: [Button NN] label/background/text_color, plus a [PWM]
+//  section with NN=<matrix value> (01-15) and released=<idle>.
+//  Mapping: label→label, background→color; buttons 1-15 with a NONZERO PWM
+//  value → matrix channel (CH7) + that value; everything else stays unassigned
+//  (channel 0) for manual setup. text_color and released are ignored.
+// ═══════════════════════════════════════════════════════════════════════════
+const KYBERPAD_MATRIX_CH = 7;
+
+function parseKyberpad(text) {
+  const buttons = {};   // "01".."45" → {label, background, text_color}
+  const pwm = {};       // "01".."15" → int
+  let released = null, section = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line[0] === '#') continue;
+    const sec = line.match(/^\[(.+)\]$/);
+    if (sec) { section = sec[1].trim(); continue; }
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    const val = line.slice(eq + 1).trim();
+    const bm = (section || '').match(/^Button\s+(\d+)$/i);
+    if (bm) {
+      const num = bm[1].padStart(2, '0');
+      (buttons[num] || (buttons[num] = {}))[key.toLowerCase()] = val;
+    } else if ((section || '').toUpperCase() === 'PWM') {
+      if (key.toLowerCase() === 'released') released = parseInt(val, 10);
+      else if (/^\d+$/.test(key)) pwm[key.padStart(2, '0')] = parseInt(val, 10);
+    }
+  }
+  return { buttons, pwm, released };
+}
+
+function applyKyberpad(text) {
+  const { buttons, pwm } = parseKyberpad(text);
+  const lua = [];
+  let assignedCount = 0;
+  for (let i = 1; i <= 45; i++) {
+    const key = String(i).padStart(2, '0');
+    const b = buttons[key] || {};
+    const color = (b.background || '').trim();
+    const pv = pwm[key];   // present only for 01-15
+    const assigned = (i <= 15) && Number.isFinite(pv) && pv > 0;   // 0 = unassigned
+    if (assigned) assignedCount++;
+    lua.push({
+      l: (b.label || '').trim(),                                    // empty ok — UI falls back to "Button N"
+      c: assigned ? KYBERPAD_MATRIX_CH : 0,
+      v: assigned ? pv : 1811,
+      k: /^#[0-9a-fA-F]{6}$/.test(color) ? color : '#4fc3f7',
+    });
+  }
+  cfg.lua = lua;
+  renderLuaButtons();
+  renderScreenLuaButtons();
+  renderSettings();
+  send({ t: 'cfg', lua });                        // partial cfg update (lua only) — firmware saves it
+  setTimeout(() => send({ t: 'getcfg' }), 300);   // re-sync from the board
+  return assignedCount;
+}
+
+function importKyberpadText(text, sourceName) {
+  const status = document.getElementById('kyberpadStatus');
+  const show = (msg, ok) => { if (status) { status.textContent = msg; status.style.color = ok ? 'var(--green)' : 'var(--red)'; } };
+  if (!/kyberpad/i.test(text.slice(0, 200)) && !/\[Button\s+\d+\]/i.test(text)) {
+    show('Not a Kyberpad file — no [Button NN] sections found.', false);
+    return;
+  }
+  try {
+    const n = applyKyberpad(text);
+    const connected = !!(transport && transport.isConnected && transport.isConnected());
+    const src = sourceName ? '"' + sourceName + '" — ' : '';
+    show(connected
+      ? `✓ Imported ${src}45 buttons (${n} on CH${KYBERPAD_MATRIX_CH}) — saved to the board.`
+      : `✓ Imported ${src}45 buttons (${n} on CH${KYBERPAD_MATRIX_CH}) locally — connect over USB to save to the board.`, true);
+  } catch (e) {
+    show('Import failed: ' + (e && e.message || e), false);
+  }
+}
+
+function onKyberpadFile(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => importKyberpadText(String(e.target.result), file.name);
+  reader.readAsText(file);
+  input.value = '';   // allow re-importing the same file
+}
+
+// Page-wide drag-and-drop for the Kyberpad file.
+(function initKyberpadDrop() {
+  const overlay = document.getElementById('kyberpadDrop');
+  let depth = 0;   // dragenter/leave fire for children too — count to know a true leave
+  const hasFiles = e => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+  const showOverlay = on => { if (overlay) overlay.style.display = on ? 'flex' : 'none'; };
+  window.addEventListener('dragenter', e => { if (!hasFiles(e)) return; e.preventDefault(); depth++; showOverlay(true); });
+  window.addEventListener('dragover',  e => { if (hasFiles(e)) e.preventDefault(); });
+  window.addEventListener('dragleave', e => { e.preventDefault(); if (--depth <= 0) { depth = 0; showOverlay(false); } });
+  window.addEventListener('drop', e => {
+    if (!(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length)) return;
+    e.preventDefault(); depth = 0; showOverlay(false);
+    const file = e.dataTransfer.files[0];
+    const reader = new FileReader();
+    reader.onload = ev => importKyberpadText(String(ev.target.result), file.name);
+    reader.readAsText(file);
+  });
+})();
 
 // ── Settings panel ────────────────────────────────────────────────────────────
 function renderSettings() {
