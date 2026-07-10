@@ -259,10 +259,12 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 
   .lua-section{width:100%;max-width:960px;}
   .lua-header{margin-bottom:6px;}
-  /* 45 buttons — cap the height so the grid doesn't dominate the page; scroll
-     for the rest (roughly 3 pages of 15 visible in the scroll area). */
-  .lua-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;max-height:340px;overflow-y:auto;padding-right:4px;}
+  /* 45 buttons shown 15 at a time (paged via .lua-page-tab). */
+  .lua-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;}
   @media(max-width:600px){.lua-grid{grid-template-columns:repeat(3,1fr);}}
+  .lua-page-tab{font-size:.6rem;font-weight:700;letter-spacing:.03em;padding:3px 9px;border-radius:5px;
+    cursor:pointer;background:var(--panel);border:1px solid var(--border);color:var(--muted);}
+  .lua-page-tab.active{border-color:var(--accent);color:var(--accent);}
   .lua-btn{
     --btn-color: #4fc3f7;
     padding:14px 6px;
@@ -464,6 +466,11 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 <div class="lua-section" id="luaSection">
   <div class="lua-header" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
     <span style="font-size:.62rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);">Lua Buttons</span>
+    <div id="luaPageTabs" style="display:flex;gap:3px;">
+      <button class="lua-page-tab" data-page="0" onclick="setLuaPage(0)">1–15</button>
+      <button class="lua-page-tab" data-page="1" onclick="setLuaPage(1)">16–30</button>
+      <button class="lua-page-tab" data-page="2" onclick="setLuaPage(2)">31–45</button>
+    </div>
     <button onclick="document.getElementById('kyberpadFile').click()" title="Import a Kyberpad config .txt to set button labels, colors, and values"
             style="font-size:.62rem;font-weight:600;letter-spacing:.04em;padding:4px 10px;border-radius:6px;cursor:pointer;background:var(--panel);border:1px solid var(--border);color:var(--accent);">⬇ Import Kyberpad file</button>
     <input type="file" id="kyberpadFile" accept=".txt,text/plain" style="display:none" onchange="onKyberpadFile(this)">
@@ -2838,10 +2845,28 @@ function renderButtons() {
 }
 
 // ── Lua / virtual button grid (45 buttons) ───────────────────────────────────
+// The top grid shows ONE page of 15 buttons at a time (of the 45 total). The
+// page tabs (1–15 / 16–30 / 31–45) switch pages. Press handlers use the
+// ABSOLUTE button index so the correct Lua action fires regardless of page.
+let _luaPage = 0;
+const LUA_PAGE_SIZE = 15;
+function setLuaPage(p) {
+  _luaPage = Math.max(0, Math.min(2, p | 0));
+  renderLuaButtons();
+}
+function updateLuaPageUI() {
+  document.querySelectorAll('#luaPageTabs .lua-page-tab').forEach(t => {
+    t.classList.toggle('active', (+t.dataset.page) === _luaPage);
+  });
+}
 function renderLuaButtons() {
   const grid = document.getElementById('luaGrid');
   grid.innerHTML = '';
-  (cfg.lua || []).forEach((btn, i) => {
+  const lua   = cfg.lua || [];
+  const start = _luaPage * LUA_PAGE_SIZE;
+  for (let i = start; i < start + LUA_PAGE_SIZE && i < lua.length; i++) {
+    const btn = lua[i];
+    const idx = i;   // absolute index — used by the press handlers
     const el = document.createElement('button');
     el.textContent = btn.l || `Button ${i+1}`;
     const assigned = btn.c !== 0;
@@ -2849,8 +2874,8 @@ function renderLuaButtons() {
     // Always apply color so it's visible even on unassigned buttons
     el.style.setProperty('--btn-color', btn.k && btn.k.length === 7 ? btn.k : '#4fc3f7');
     if (assigned) {
-      const press = () => { el.classList.add('pressed');    send({t:'lua',i,p:true}); };
-      const rel   = () => { el.classList.remove('pressed'); send({t:'lua',i,p:false}); };
+      const press = () => { el.classList.add('pressed');    send({t:'lua',i:idx,p:true}); };
+      const rel   = () => { el.classList.remove('pressed'); send({t:'lua',i:idx,p:false}); };
       el.addEventListener('mousedown',  press);
       el.addEventListener('mouseup',    rel);
       el.addEventListener('mouseleave', rel);
@@ -2858,7 +2883,8 @@ function renderLuaButtons() {
       el.addEventListener('touchend',   (e)=>{e.preventDefault();rel();},  {passive:false});
     }
     grid.appendChild(el);
-  });
+  }
+  updateLuaPageUI();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
