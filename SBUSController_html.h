@@ -260,8 +260,8 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   .lua-section{width:100%;max-width:960px;}
   .lua-header{margin-bottom:6px;}
   /* 45 buttons shown 15 at a time (paged via .lua-page-tab). */
+  /* Fixed 5×3 (15 buttons per page) to match the TX screen pod + transmitter. */
   .lua-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;}
-  @media(max-width:600px){.lua-grid{grid-template-columns:repeat(3,1fr);}}
   .lua-page-tab{font-size:.6rem;font-weight:700;letter-spacing:.03em;padding:3px 9px;border-radius:5px;
     cursor:pointer;background:var(--panel);border:1px solid var(--border);color:var(--muted);}
   .lua-page-tab.active{border-color:var(--accent);color:var(--accent);}
@@ -415,7 +415,7 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
     .ts-col{width:100%;}
     .slider-widget{flex-direction:column;align-items:center;padding:6px 8px;width:100%;}
     .slider-wrap{width:100%;height:28px;}.slider-inp{width:90%;transform:none;transform-origin:unset;}
-    .lua-grid{grid-template-columns:repeat(4,1fr);gap:5px;}.lua-btn{padding:10px 4px;font-size:.7rem;}
+    .lua-grid{gap:5px;}.lua-btn{padding:10px 4px;font-size:.7rem;}
     .trim-bank{gap:4px;}.trim-widget{padding:5px 6px;}.trim-btn{width:34px;height:24px;}
     .pot-row{gap:8px;}.pot-widget{min-width:0;flex:1;}.pot-inp{width:100%;}
     .cfg-table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;}
@@ -423,7 +423,7 @@ static const char HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   @media(max-width:820px) and (orientation:landscape){
     body{padding:4px;gap:4px;}.stick-wrap{width:min(28vw,155px);}.stick-card{padding:8px;}
     .thumb{width:30px;height:30px;}.sw-card{width:60px;padding:5px 4px;}
-    .lua-grid{grid-template-columns:repeat(6,1fr);}.lua-btn{padding:8px 4px;font-size:.65rem;}
+    .lua-btn{padding:8px 4px;font-size:.65rem;}
     .trim-btn{width:32px;height:22px;font-size:.7rem;}
   }
 </style>
@@ -2891,9 +2891,11 @@ function renderLuaButtons() {
 //  Kyberpad import — drop (or pick) a Kyberpad config .txt to set the 45 Lua
 //  buttons. INI-style: [Button NN] label/background/text_color, plus a [PWM]
 //  section with NN=<matrix value> (01-15) and released=<idle>.
-//  Mapping: label→label, background→color; buttons 1-15 with a NONZERO PWM
-//  value → matrix channel (CH7) + that value; everything else stays unassigned
-//  (channel 0) for manual setup. text_color and released are ignored.
+//  Mapping: label→label, background→color. The 15 PWM levels (matrix values)
+//  are SHARED across all 3 pages of 15 — button i uses level ((i-1)%15)+1 on
+//  the matrix channel (CH7); a level of 0 is unassigned. So buttons 1/16/31
+//  send the same value on CH7 (the page is distinguished on the hardware side,
+//  e.g. a page switch). text_color and released are ignored.
 // ═══════════════════════════════════════════════════════════════════════════
 const KYBERPAD_MATRIX_CH = 7;
 
@@ -2930,8 +2932,13 @@ function applyKyberpad(text) {
     const key = String(i).padStart(2, '0');
     const b = buttons[key] || {};
     const color = (b.background || '').trim();
-    const pv = pwm[key];   // present only for 01-15
-    const assigned = (i <= 15) && Number.isFinite(pv) && pv > 0;   // 0 = unassigned
+    // The 15 PWM levels (matrix values) are SHARED across all 3 pages of 15:
+    // button i uses the level at position ((i-1)%15)+1, so button 16 reuses
+    // button 1's value (176), 31 reuses it too, etc. — all on the matrix
+    // channel. A level of 0 (positions 11-13 here) means unassigned.
+    const posKey = String(((i - 1) % 15) + 1).padStart(2, '0');
+    const pv = pwm[posKey];
+    const assigned = Number.isFinite(pv) && pv > 0;
     if (assigned) assignedCount++;
     lua.push({
       l: (b.label || '').trim(),                                    // empty ok — UI falls back to "Button N"
