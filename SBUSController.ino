@@ -998,27 +998,40 @@ static void broadcastJson(const String& msg) {
   serialOutboxPump();
 }
 
-void processCommandJson(const char* json) {
+// wsClient = the WebSocket client this command arrived on, or nullptr when it
+// came in over Serial.  Only PING needs to know: its reply is addressed back to
+// the asking client rather than broadcast.
+void processCommandJson(const char* json, AsyncWebSocketClient* wsClient) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) return;
   const char* t = doc["t"] | "";
 
-  // ── PING / PONG (Serial host liveness handshake) ─────────────────────────
-  // The Web Serial config tool sends {t:"ping"} on connect and then refreshes
-  // every few seconds.  We reply with {t:"pong",ver:N} so the client can see
-  // it's connected to the right firmware, and stamp g_serialHostLastSeenMs so
-  // broadcastJson() starts mirroring WS broadcasts to the serial port.
+  // ── PING / PONG (host liveness handshake) ────────────────────────────────
+  // Both clients send {t:"ping"} on connect and then refresh every few seconds;
+  // we reply {t:"pong",ver:N,fwver:"…"} so they can see they're talking to the
+  // right firmware.  The reply is also the browser's heartbeat: a half-open
+  // socket (laptop suspended, AP dropped, board powered off) keeps its
+  // readyState OPEN and fires no close event, so a PONG that stops arriving is
+  // the only reliable "the link is gone" signal the UI gets.
   if (!strcmp(t, "ping")) {
-    g_serialHostLastSeenMs = millis();
     String resp = "{\"t\":\"pong\",\"ver\":";
     resp += CFG_VER;
     resp += ",\"fwver\":\"";
     resp += FW_VERSION;
     resp += "\"}";
-    // Reply only over Serial — WS clients use the WebSocket open event for
-    // the same purpose, so echoing PONGs to all WS clients would be noise.
-    // Routed through the outbox so it can never interleave into the middle
-    // of a partially-drained JSON line (e.g. a cfg dump in flight).
+    if (wsClient) {
+      // Answer this client only — broadcasting PONGs to every WS client would
+      // just be noise on the others.  Deliberately does NOT stamp the
+      // serial-host timer: a WiFi client is no reason to start dumping JSON
+      // over the serial port at a human watching the monitor.
+      wsClient->text(resp);
+      return;
+    }
+    // Serial: stamp the host-alive window so broadcastJson() starts mirroring
+    // WS broadcasts to the port.  Routed through the outbox so the reply can
+    // never interleave into the middle of a partially-drained JSON line (e.g.
+    // a cfg dump in flight).
+    g_serialHostLastSeenMs = millis();
     serialEnqueueLine(resp.c_str(), resp.length());
     serialOutboxPump();
     return;
@@ -1330,7 +1343,7 @@ void processCommandJson(const char* json) {
 
 // Thin WebSocket wrapper — kept so the existing onWsEvent dispatch is unchanged.
 void handleWsMessage(AsyncWebSocketClient* client, const char* json) {
-  processCommandJson(json);
+  processCommandJson(json, client);
 }
 
 // Accumulation buffer for multi-frame WebSocket messages.
@@ -1654,7 +1667,7 @@ static void handleSerialCommands() {
     // ── JSON line in progress: keep collecting until newline ─────────────────
     if (g_serialInJson) {
       if (c == '\n' || c == '\r') {
-        if (g_serialJsonBuf.length() > 0) processCommandJson(g_serialJsonBuf.c_str());
+        if (g_serialJsonBuf.length() > 0) processCommandJson(g_serialJsonBuf.c_str(), nullptr);
         g_serialJsonBuf = "";
         g_serialInJson  = false;
         continue;

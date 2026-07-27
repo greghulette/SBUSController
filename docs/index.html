@@ -45,6 +45,10 @@
     transition:all .3s;
   }
   #connBadge.connected{border-color:var(--green);color:var(--green);}
+  /* Link dropped but we're actively retrying — amber, and pulsing so a glance
+     at the header tells you the page is stale without having to read it. */
+  #connBadge.reconnecting{border-color:var(--yellow);color:var(--yellow);animation:badgePulse 1.4s ease-in-out infinite;}
+  @keyframes badgePulse{0%,100%{opacity:1;}50%{opacity:.4;}}
   .hdr-btn{
     font-size:.7rem;font-weight:700;letter-spacing:.07em;
     padding:4px 12px;border-radius:20px;cursor:pointer;
@@ -1280,37 +1284,68 @@ let joyTimer = null;
 // Add a new transport by implementing the four methods below; the Connect
 // button (top bar) decides which one to activate.
 
+// ── Link liveness ───────────────────────────────────────────────────────────
+// Neither transport reports a dropped link reliably on its own.  A WebSocket
+// only fires onclose when the TCP connection is torn down cleanly; suspend the
+// laptop, drop off the AP, or pull the board's power and the socket is left
+// HALF-OPEN — readyState stays OPEN, no event fires, and the UI happily shows
+// CONNECTED against a board that isn't there.  (The browser's own TCP timeout
+// can take many minutes to notice.)  Web Serial has the same hole: a port
+// handle can survive a suspend and simply never deliver another byte.
+//
+// So we don't trust the socket — we drive our own heartbeat.  Every transport
+// PINGs on a fixed cadence and stamps _lastRxMs on ANY inbound traffic; if
+// nothing at all comes back within LINK_TIMEOUT_MS the link is declared dead.
+// The firmware answers {t:"ping"} with a PONG on both transports, so an idle
+// but healthy link still produces traffic and never trips the watchdog.
+const LINK_PING_MS    = 3000;   // heartbeat cadence
+const LINK_TIMEOUT_MS = 9000;   // three missed heartbeats ⇒ link is dead
+const LINK_PROBE_MS   = 2500;   // shorter deadline for an on-wake probe
+
 // --- Base interface (also handy as a no-op fallback) ---
 class Transport {
   constructor() {
     this.label = '';                              // user-facing name
     this.onmessage = (_msg) => {};                // inbound dispatcher
-    this.onstate   = (_connected) => {};          // connection state change
+    this.onstate   = (_connected, _detail) => {}; // connection state change
   }
   open()           { /* override */ }
   close()          { /* override */ }
   send(_obj)       { /* override */ }
   isConnected()    { return false; }
+  probe()          { /* override — force an immediate liveness check */ }
 }
 
 // --- WebSocket-over-WiFi (original behaviour) ---
 class WsTransport extends Transport {
-  constructor() { super(); this.label = 'WiFi'; this.ws = null; this._reconnectTimer = null; }
+  constructor() {
+    super();
+    this.label = 'WiFi';
+    this.ws = null;
+    this._reconnectTimer = null;
+    this._hbTimer  = null;   // heartbeat + watchdog interval
+    this._lastRxMs = 0;      // stamped by every inbound frame (PONG or broadcast)
+  }
   open() {
     this.ws = new WebSocket(`ws://${location.hostname}/ws`);
-    this.ws.onopen  = () => this.onstate(true);
+    this.ws.onopen  = () => {
+      this._lastRxMs = Date.now();
+      this._startHeartbeat();
+      this.onstate(true);
+    };
     this.ws.onclose = () => {
-      this.onstate(false);
-      // Auto-reconnect — only while THIS transport is still the active one.
-      // Switching to SerialTransport sets transport=… elsewhere and we stop.
-      this._reconnectTimer = setTimeout(() => { if (transport === this) this.open(); }, 3000);
+      this._stopHeartbeat();
+      this.onstate(false, 'reconnecting');
+      this._scheduleReconnect();
     };
     this.ws.onerror = () => {};
     this.ws.onmessage = (e) => {
+      this._lastRxMs = Date.now();
       try { this.onmessage(JSON.parse(e.data)); } catch(_) {}
     };
   }
   close() {
+    this._stopHeartbeat();
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     if (this.ws) {
       // Detach handlers BEFORE closing: the close event fires async, and a
@@ -1325,6 +1360,60 @@ class WsTransport extends Transport {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj));
   }
   isConnected() { return this.ws && this.ws.readyState === WebSocket.OPEN; }
+
+  // Auto-reconnect — only while THIS transport is still the active one.
+  // Switching to SerialTransport sets transport=… elsewhere and we stop.
+  // Guarded so a close event and a watchdog trip can't stack two timers.
+  _scheduleReconnect() {
+    if (this._reconnectTimer) return;
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      if (transport === this) this.open();
+    }, 3000);
+  }
+
+  _startHeartbeat() {
+    this._stopHeartbeat();
+    this._hbTimer = setInterval(() => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - this._lastRxMs > LINK_TIMEOUT_MS) { this._linkLost(); return; }
+      this.send({ t: 'ping' });
+    }, LINK_PING_MS);
+  }
+  _stopHeartbeat() { if (this._hbTimer) { clearInterval(this._hbTimer); this._hbTimer = null; } }
+
+  // Drop a half-open socket and start over.  close() on a half-open socket may
+  // never fire onclose, so we detach the handlers and drive the reconnect
+  // ourselves rather than waiting on an event that isn't coming.
+  _linkLost() {
+    this._stopHeartbeat();
+    if (this.ws) {
+      this.ws.onopen = this.ws.onclose = this.ws.onerror = this.ws.onmessage = null;
+      try { this.ws.close(); } catch(_) {}
+      this.ws = null;
+    }
+    console.warn('[transport] WiFi link lost (no traffic for ' + LINK_TIMEOUT_MS + ' ms)');
+    this.onstate(false, 'reconnecting');
+    this._scheduleReconnect();
+  }
+
+  // Called when the page wakes up (tab re-shown, machine resumed from sleep).
+  // A socket that slept through a suspend is almost always dead, so don't make
+  // the user stare at a stale CONNECTED for a full timeout — ping now and hold
+  // it to the shorter probe deadline.
+  probe() {
+    if (this.ws && this.ws.readyState === WebSocket.CONNECTING) return;   // already trying
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // Nothing open: pull the retry forward instead of waiting out its timer.
+      if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+      if (transport === this) this.open();
+      return;
+    }
+    this.send({ t: 'ping' });
+    setTimeout(() => {
+      if (transport === this && this.ws && Date.now() - this._lastRxMs > LINK_PROBE_MS) this._linkLost();
+    }, LINK_PROBE_MS);
+  }
 }
 
 // --- Web Serial over USB (Chrome / Edge only) -------------------------------
@@ -1343,6 +1432,7 @@ class SerialTransport extends Transport {
     this.pingTimer = null;
     this.connected = false;
     this._closing  = false;
+    this._lastRxMs = 0;            // stamped by every inbound byte — see LINK_TIMEOUT_MS
   }
 
   // existingPort: an already-granted SerialPort to reuse WITHOUT the picker
@@ -1375,6 +1465,7 @@ class SerialTransport extends Transport {
       this.reader = decoder.readable.getReader();
 
       this.connected = true;
+      this._lastRxMs = Date.now();
       this.onstate(true);
 
       // Read loop runs forever until cancel(); when it exits we treat the
@@ -1382,9 +1473,15 @@ class SerialTransport extends Transport {
       this._readLoop();
 
       // Identify ourselves and keep the host-alive stamp fresh so the
-      // firmware echoes broadcastJson() to Serial.
+      // firmware echoes broadcastJson() to Serial.  The same beat doubles as
+      // the liveness watchdog: an unplugged cable usually ends the read loop,
+      // but a suspended machine or a wedged board can leave the port open and
+      // silent — the PONG that stops arriving is what catches that.
       this.send({ t: 'ping' });
-      this.pingTimer = setInterval(() => this.send({ t: 'ping' }), 3000);
+      this.pingTimer = setInterval(() => {
+        if (Date.now() - this._lastRxMs > LINK_TIMEOUT_MS) { this._linkLost(); return; }
+        this.send({ t: 'ping' });
+      }, LINK_PING_MS);
       // Pull the firmware's current config — Serial has no equivalent of the
       // WebSocket's open-event auto-sync, so without this the UI would show
       // its initial JS defaults until the user triggers something that fires
@@ -1421,6 +1518,7 @@ class SerialTransport extends Transport {
       while (true) {
         const { value, done } = await this.reader.read();
         if (done) break;
+        this._lastRxMs = Date.now();   // any byte proves the port is still live
         buf += value;
         let idx;
         while ((idx = buf.indexOf('\n')) >= 0) {
@@ -1473,6 +1571,27 @@ class SerialTransport extends Transport {
       .catch(err => console.error('[SerialTransport] write failed:', err));
   }
 
+  // Port is open but has gone silent (suspend, wedged board, half-dead CDC).
+  // Tear it down and report honestly.  No auto-reopen: after a suspend the
+  // SerialPort handle is usually stale and needs a fresh pick, which Web Serial
+  // only allows from a user gesture — so the user re-picks USB Serial.
+  async _linkLost() {
+    if (!this.connected) return;
+    console.warn('[transport] USB Serial link lost (no data for ' + LINK_TIMEOUT_MS + ' ms)');
+    const wasActive = (transport === this);
+    try { await this.close(); } catch (_) {}
+    if (wasActive) this.onstate(false);
+  }
+
+  // Force an immediate liveness check on wake — same idea as WsTransport.probe.
+  probe() {
+    if (!this.connected) return;
+    this.send({ t: 'ping' });
+    setTimeout(() => {
+      if (transport === this && Date.now() - this._lastRxMs > LINK_PROBE_MS) this._linkLost();
+    }, LINK_PROBE_MS);
+  }
+
   isConnected() { return this.connected; }
 }
 
@@ -1492,8 +1611,14 @@ function handleInboundMessage(msg) {
 let _lastPongMs = 0;   // updated on every PONG — used by post-flash reconnect liveness check
 function handlePong(msg) {
   _lastPongMs = Date.now();
-  if (msg.fwver != null) { cfg.fwver = msg.fwver; updateFwVersion(); }
-  console.log('[transport] PONG  ver=' + msg.ver + '  fw=' + (msg.fwver || '?'));
+  // PONGs now arrive every LINK_PING_MS on both transports (they're the
+  // heartbeat), so only touch the DOM and the log when something actually
+  // changed — otherwise this repaints the version chip 20 times a minute.
+  if (msg.fwver != null && msg.fwver !== cfg.fwver) {
+    cfg.fwver = msg.fwver;
+    updateFwVersion();
+    console.log('[transport] PONG  ver=' + msg.ver + '  fw=' + (msg.fwver || '?'));
+  }
 }
 
 // Show the connected board's firmware version in the header chip + TX screen.
@@ -1554,7 +1679,7 @@ async function checkFirmwareVersion(forceFetch) {
 // page the token is never replaced, so we fall back to "dev". Compare this
 // (latest build) against the header's FW version (what's on the board) to see
 // whether the board needs a flash.
-const UI_VERSION = '10.10:44.R.JUL.2026';
+const UI_VERSION = '27.14:12.R.JUL.2026';
 function initFooterVersion() {
   const el = document.getElementById('footer-ui-version');
   if (el) el.textContent = UI_VERSION.startsWith('__') ? 'dev' : UI_VERSION;
@@ -1584,6 +1709,29 @@ function connect() {
   if (transport instanceof WsTransport) transport.open();
 }
 function send(obj) { if (transport) transport.send(obj); }
+
+// ── Wake-up probes ──────────────────────────────────────────────────────────
+// The heartbeat watchdog catches a dead link on its own, but it can't run while
+// the machine is asleep — so after a hibernate you'd sit on a stale CONNECTED
+// until the timers restart and the first beat times out.  These events fire the
+// moment the page comes back, so we probe immediately instead:
+//   visibilitychange — tab refocused, and the reliable "resumed from sleep" tell
+//   pageshow         — restored from the browser's back/forward cache
+//   online/offline   — the OS gained or lost a network
+// Never during a flash: esptool owns the port then, and transport is torn down.
+function _probeLink() {
+  if (_fwFlashing) return;
+  if (transport && transport.probe) transport.probe();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') _probeLink();
+});
+window.addEventListener('pageshow', (e) => { if (e.persisted) _probeLink(); });
+window.addEventListener('online',  _probeLink);
+window.addEventListener('offline', () => {
+  // No network at all — say so now rather than waiting for the watchdog.
+  if (!_fwFlashing && transport instanceof WsTransport) setBadge(false, 'reconnecting');
+});
 
 // ── Transport picker UI ─────────────────────────────────────────────────────
 // Toggle the floating menu under the transport button.
@@ -2355,10 +2503,14 @@ function wireSvgSwitchHandlers() {
   });
 }
 
-function setBadge(on) {
+// detail (optional) distinguishes "link dropped, retrying in the background"
+// from "not connected at all" — the transports pass 'reconnecting' for the
+// former so the badge can show an amber, pulsing state instead of a flat red.
+function setBadge(on, detail) {
   const b = document.getElementById('connBadge');
-  b.textContent = on ? 'CONNECTED' : 'DISCONNECTED';
-  b.className   = on ? 'connected' : '';
+  const retrying = !on && detail === 'reconnecting';
+  b.textContent = on ? 'CONNECTED' : (retrying ? 'RECONNECTING…' : 'DISCONNECTED');
+  b.className   = on ? 'connected' : (retrying ? 'reconnecting' : '');
   if (!on) { cfg.fwver = null; updateFwVersion(); }   // clear stale version when disconnected
 }
 
