@@ -1469,6 +1469,7 @@ class SerialTransport extends Transport {
     this.connected = false;
     this._closing  = false;
     this._lastRxMs = 0;            // stamped by every inbound byte — see LINK_TIMEOUT_MS
+    this._stalled  = false;        // open but silent; recovers on its own, never closes
   }
 
   // existingPort: an already-granted SerialPort to reuse WITHOUT the picker
@@ -1502,6 +1503,7 @@ class SerialTransport extends Transport {
 
       this.connected = true;
       this._lastRxMs = Date.now();
+      this._stalled  = false;
       this.onstate(true);
 
       // Read loop runs forever until cancel(); when it exits we treat the
@@ -1514,8 +1516,10 @@ class SerialTransport extends Transport {
       // but a suspended machine or a wedged board can leave the port open and
       // silent — the PONG that stops arriving is what catches that.
       this.send({ t: 'ping' });
+      // Keep pinging even while stalled — the ping is also how we notice the
+      // port coming back, and it costs nothing on a port that's already open.
       this.pingTimer = setInterval(() => {
-        if (Date.now() - this._lastRxMs > LINK_TIMEOUT_MS) { this._linkLost(); return; }
+        if (Date.now() - this._lastRxMs > LINK_TIMEOUT_MS) this._markStalled();
         this.send({ t: 'ping' });
       }, LINK_PING_MS);
       // Pull the firmware's current config — Serial has no equivalent of the
@@ -1555,6 +1559,13 @@ class SerialTransport extends Transport {
         const { value, done } = await this.reader.read();
         if (done) break;
         this._lastRxMs = Date.now();   // any byte proves the port is still live
+        // Bytes resumed after a silent spell — recover without touching the
+        // port (see _markStalled on why closing it is never the answer).
+        if (this._stalled) {
+          this._stalled = false;
+          console.log('[transport] USB Serial recovered');
+          if (transport === this) this.onstate(true);
+        }
         buf += value;
         let idx;
         while ((idx = buf.indexOf('\n')) >= 0) {
@@ -1608,23 +1619,36 @@ class SerialTransport extends Transport {
   }
 
   // Port is open but has gone silent (suspend, wedged board, half-dead CDC).
-  // Tear it down and report honestly.  No auto-reopen: after a suspend the
-  // SerialPort handle is usually stale and needs a fresh pick, which Web Serial
-  // only allows from a user gesture — so the user re-picks USB Serial.
-  async _linkLost() {
-    if (!this.connected) return;
-    console.warn('[transport] USB Serial link lost (no data for ' + LINK_TIMEOUT_MS + ' ms)');
-    const wasActive = (transport === this);
-    try { await this.close(); } catch (_) {}
-    if (wasActive) this.onstate(false);
+  // Report it — but do NOT close the port.
+  //
+  // Closing is not a neutral act on this hardware.  On the S3's native USB CDC,
+  // releasing the port toggles DTR/RTS, and the USB-Serial/JTAG peripheral
+  // treats that as a reset request: it REBOOTS THE BOARD (shows up as reset
+  // reason ESP_RST_USB / RTC code 21 USB_UART_CHIP_RESET).  An earlier version
+  // of this watchdog closed on suspicion, which meant a single false positive
+  // didn't just mis-report a healthy link — it reset a running board, and the
+  // reset then made the dead link real.  Never close on suspicion.
+  //
+  // Nothing is lost by staying open.  A genuinely dead port ends the read loop
+  // with EOF, and _readLoop's finally reports that already.  This path only
+  // covers "open but silent", and leaving the port up lets it self-heal: the
+  // read loop is still running, so if bytes resume we go straight back to
+  // connected without the user touching anything.
+  _markStalled() {
+    if (this._stalled || !this.connected) return;
+    this._stalled = true;
+    console.warn('[transport] USB Serial silent for ' + LINK_TIMEOUT_MS +
+                 ' ms — port left OPEN (closing it would reset the board)');
+    if (transport === this) this.onstate(false, 'reconnecting');
   }
 
-  // Force an immediate liveness check on wake — same idea as WsTransport.probe.
+  // Force an immediate liveness check on wake — same idea as WsTransport.probe,
+  // except this one can only ever downgrade the badge, never touch the port.
   probe() {
     if (!this.connected) return;
     this.send({ t: 'ping' });
     setTimeout(() => {
-      if (transport === this && Date.now() - this._lastRxMs > LINK_PROBE_MS) this._linkLost();
+      if (transport === this && Date.now() - this._lastRxMs > LINK_PROBE_MS) this._markStalled();
     }, LINK_PROBE_MS);
   }
 
@@ -1665,7 +1689,7 @@ function handleBootLog(msg) {
   const colour   = abnormal ? 'var(--yellow)' : 'var(--green)';
   sum.innerHTML =
     `<div>Last reset &nbsp;<b style="color:${colour};">${msg.rstn || '?'}</b>` +
-    `<span style="color:var(--muted);"> (code ${msg.rst}, RTC ${msg.rtc0})</span></div>` +
+    `<span style="color:var(--muted);"> (code ${msg.rst}, RTC ${msg.rtc0} ${msg.rtcn || ''})</span></div>` +
     `<div style="color:var(--muted);">Boots since power applied <b style="color:var(--text);">${msg.n}</b>` +
     ` &nbsp;·&nbsp; previous boot ran <b style="color:var(--text);">${_fmtRan(msg.prev)}</b>` +
     ` &nbsp;·&nbsp; up now <b style="color:var(--text);">${_fmtRan(msg.up)}</b></div>`;
@@ -1677,7 +1701,7 @@ function handleBootLog(msg) {
     tr.innerHTML =
       `<td style="padding:4px 8px;color:var(--muted);">${i === 0 ? 'now' : '-' + i}</td>` +
       `<td style="padding:4px 8px;color:${b.r === 1 ? 'var(--text)' : 'var(--yellow)'};">${b.rn}</td>` +
-      `<td style="padding:4px 8px;color:var(--muted);">${b.rtc0}</td>` +
+      `<td style="padding:4px 8px;color:var(--muted);">${b.rtc0} ${b.rtcn || ''}</td>` +
       `<td style="padding:4px 8px;">${_fmtRan(b.ran)}</td>`;
     tb.appendChild(tr);
   });
@@ -1771,7 +1795,7 @@ async function checkFirmwareVersion(forceFetch) {
 // page the token is never replaced, so we fall back to "dev". Compare this
 // (latest build) against the header's FW version (what's on the board) to see
 // whether the board needs a flash.
-const UI_VERSION = '11.19:03.R.AUG.2026';
+const UI_VERSION = '11.19:24.R.AUG.2026';
 function initFooterVersion() {
   const el = document.getElementById('footer-ui-version');
   if (el) el.textContent = UI_VERSION.startsWith('__') ? 'dev' : UI_VERSION;

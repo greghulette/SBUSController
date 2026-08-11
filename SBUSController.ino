@@ -1566,16 +1566,57 @@ static esp_reset_reason_t g_thisReset  = ESP_RST_UNKNOWN;
 static int                g_thisRtc0   = 0;
 static uint32_t           g_prevRanMs  = 0;       // uptime the previous boot reached
 
+// Cover the WHOLE esp_reset_reason_t enum, not just the causes we expected.
+// An earlier version stopped at BROWNOUT and fell through to "other", which
+// hid a real diagnosis behind a bare number the first time it mattered: a
+// board resetting via USB reported only "other (code 11)".  A reset-reason
+// table that can't name the reset is worthless exactly when you need it.
 static const char* resetReasonName(int r) {
   switch ((esp_reset_reason_t)r) {
-    case ESP_RST_POWERON:  return "Power-on / EN reset";
-    case ESP_RST_SW:       return "Software restart (incl. boot-guard retry)";
-    case ESP_RST_PANIC:    return "Crash (panic)";
-    case ESP_RST_INT_WDT:  return "Interrupt watchdog";
-    case ESP_RST_TASK_WDT: return "Task watchdog";
-    case ESP_RST_WDT:      return "RTC watchdog (short-WDT bootloader fired)";
-    case ESP_RST_BROWNOUT: return "BROWNOUT — supply rail sagged";
-    default:               return "other";
+    case ESP_RST_POWERON:    return "Power-on / EN reset";
+    case ESP_RST_EXT:        return "External pin reset";
+    case ESP_RST_SW:         return "Software restart (incl. boot-guard retry)";
+    case ESP_RST_PANIC:      return "Crash (panic)";
+    case ESP_RST_INT_WDT:    return "Interrupt watchdog";
+    case ESP_RST_TASK_WDT:   return "Task watchdog";
+    case ESP_RST_WDT:        return "RTC watchdog (short-WDT bootloader fired)";
+    case ESP_RST_DEEPSLEEP:  return "Wake from deep sleep";
+    case ESP_RST_BROWNOUT:   return "BROWNOUT — supply rail sagged";
+    case ESP_RST_SDIO:       return "SDIO reset";
+    case ESP_RST_USB:        return "USB peripheral reset (host toggled the CDC port)";
+    case ESP_RST_JTAG:       return "JTAG reset";
+    case ESP_RST_EFUSE:      return "eFuse error";
+    case ESP_RST_PWR_GLITCH: return "Power glitch detected";
+    case ESP_RST_CPU_LOCKUP: return "CPU lockup (double exception)";
+    default:                 return "unknown";
+  }
+}
+
+// Low-level per-core cause from rom/rtc.h (RESET_REASON).  Finer-grained than
+// esp_reset_reason() — it distinguishes WHICH watchdog, and separates a
+// USB-CDC reset (21) from a USB-JTAG one (22).
+static const char* rtcResetName(int c) {
+  switch (c) {
+    case 1:  return "POWERON";
+    case 3:  return "RTC_SW_SYS";
+    case 5:  return "DEEPSLEEP";
+    case 7:  return "TG0WDT_SYS";
+    case 8:  return "TG1WDT_SYS";
+    case 9:  return "RTCWDT_SYS";
+    case 10: return "INTRUSION";
+    case 11: return "TG0WDT_CPU";
+    case 12: return "RTC_SW_CPU";
+    case 13: return "RTCWDT_CPU";
+    case 15: return "RTCWDT_BROWN_OUT";
+    case 16: return "RTCWDT_RTC";
+    case 17: return "TG1WDT_CPU";
+    case 18: return "SUPER_WDT";
+    case 19: return "GLITCH_RTC";
+    case 20: return "EFUSE";
+    case 21: return "USB_UART_CHIP";
+    case 22: return "USB_JTAG_CHIP";
+    case 23: return "POWER_GLITCH";
+    default: return "?";
   }
 }
 
@@ -1588,8 +1629,9 @@ static void printBootTelemetry() {
   // Low-level per-core causes (rom/rtc.h). Key S3 codes:
   //   1 = power-on   15 = RTC-WDT brown-out   16 = RTC-WDT system reset
   //   (16 = the short-WDT bootloader's 3 s watchdog fired — auto-retry)
-  Serial.printf("Reset reason: %d - %s  (RTC codes core0=%d core1=%d)\n",
-                (int)r, name, (int)rtc_get_reset_reason(0), (int)rtc_get_reset_reason(1));
+  Serial.printf("Reset reason: %d - %s  (RTC codes core0=%d %s, core1=%d)\n",
+                (int)r, name, (int)rtc_get_reset_reason(0),
+                rtcResetName((int)rtc_get_reset_reason(0)), (int)rtc_get_reset_reason(1));
 
   // Read the previous boot's last uptime stamp BEFORE the power-loss check
   // clears it — after a true power loss the RTC RAM is garbage, so it's only
@@ -1629,6 +1671,7 @@ static String buildBootLogJson() {
   doc["rst"]  = (int)g_thisReset;
   doc["rstn"] = resetReasonName((int)g_thisReset);
   doc["rtc0"] = g_thisRtc0;
+  doc["rtcn"] = rtcResetName(g_thisRtc0);
   doc["n"]    = g_bootAttempts;
   doc["prev"] = g_prevRanMs;
   doc["up"]   = millis();
@@ -1641,6 +1684,7 @@ static String buildBootLogJson() {
     o["r"]    = b.reason;
     o["rn"]   = resetReasonName(b.reason);
     o["rtc0"] = b.rtc0;
+    o["rtcn"] = rtcResetName(b.rtc0);
     o["ran"]  = b.ranMs;
   }
   String out;

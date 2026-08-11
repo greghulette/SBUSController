@@ -63,17 +63,35 @@ terminal to be attached at the moment it happens.
 The panel header flags an abnormal reset and counts repeats for the session, so
 a board resetting every few minutes is obvious without watching for it.
 
-| Reset reason | Usually means |
-|---|---|
-| `Power-on / EN reset` | normal — power applied, or the reset button |
-| `BROWNOUT` | supply rail sagged; check power, not firmware |
-| `Task watchdog` / `Interrupt watchdog` | something blocked the loop past its deadline |
-| `RTC watchdog` | the short-WDT bootloader's 3 s timer fired during early boot |
-| `Crash (panic)` | firmware fault |
-| `Software restart` | a deliberate `ESP.restart()` — includes the boot-guard retry |
+| Reset reason | RTC code | Usually means |
+|---|---|---|
+| `Power-on / EN reset` | 1 | normal — power applied, or the reset button |
+| `USB peripheral reset` | 21 `USB_UART_CHIP` | **the host reset the chip via the CDC port** — see below |
+| `BROWNOUT` | 15 | supply rail sagged; check power, not firmware |
+| `Task watchdog` / `Interrupt watchdog` | 7 / 8 / 11 / 17 | something blocked the loop past its deadline |
+| `RTC watchdog` | 9 / 13 / 16 | the short-WDT bootloader's 3 s timer fired during early boot |
+| `Crash (panic)` | 3 | firmware fault |
+| `Software restart` | 3 / 12 | a deliberate `ESP.restart()` — includes the boot-guard retry |
 
 **Ran for** is the most diagnostic field. A consistent figure points at something
-in the firmware; a random one usually means power.
+in the firmware; a random one usually means power or the host.
+
+### USB resets (`ESP_RST_USB` / `USB_UART_CHIP_RESET`)
+
+On the S3's **native** USB (`USBMode=hwcdc`) there is no USB-serial bridge chip —
+the USB-Serial/JTAG peripheral is wired straight into the reset logic, and the
+host asserting DTR/RTS resets the chip. That is the mechanism esptool uses to
+enter download mode, and it fires for any host that does the same thing:
+
+- opening or **closing** the port (a serial terminal, or the UI's own Web Serial
+  session — this is why the link watchdog never closes a port on suspicion)
+- Windows enumerating or probing the COM port in the background
+- USB selective-suspend cycling the device
+- a second application grabbing the port while the UI holds it
+
+If the board resets while nobody is touching it and the reason is code 11,
+suspect the host, not the firmware. **Driving over WiFi avoids it entirely** —
+no CDC session, no DTR/RTS, no USB reset path.
 
 ## Hardware
 
