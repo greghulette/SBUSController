@@ -1129,6 +1129,42 @@
   </details>
 </div>
 
+<!-- ── Diagnostics ──────────────────────────────────────────────────────────────
+     Reset history read out of the board's RTC RAM.  Deliberately NOT inside
+     fwWrap: this has to work on the ESP-served page too, and it's most needed
+     over USB Serial — where the UI owns the port and a serial terminal can't
+     be attached to watch the boot banner. -->
+<div class="settings-wrap">
+  <details id="diagDetails" ontoggle="if(this.open) requestBootLog()">
+    <summary>Diagnostics</summary>
+    <div class="settings-body">
+      <div style="font-size:.74rem;color:var(--muted);margin-bottom:10px;line-height:1.5;">
+        Why the board last restarted, kept in RTC RAM so it survives every reset except
+        losing power. <b style="color:var(--text)">Ran for</b> is how long the previous
+        boot lasted before it died — a consistent figure points at something in the
+        firmware, a random one usually means power.
+      </div>
+      <div id="diag-summary" style="font-size:.72rem;font-family:monospace;background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:8px 12px;margin-bottom:10px;line-height:1.7;">
+        <span style="color:var(--muted);">Connect to read boot history.</span>
+      </div>
+      <div id="diag-log-wrap" style="display:none;overflow-x:auto;">
+        <table id="diag-log" style="width:100%;border-collapse:collapse;font-size:.7rem;font-family:monospace;">
+          <thead><tr>
+            <th style="text-align:left;padding:4px 8px;color:var(--muted);font-weight:600;">#</th>
+            <th style="text-align:left;padding:4px 8px;color:var(--muted);font-weight:600;">Reset reason</th>
+            <th style="text-align:left;padding:4px 8px;color:var(--muted);font-weight:600;">RTC</th>
+            <th style="text-align:left;padding:4px 8px;color:var(--muted);font-weight:600;">Ran for</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div style="margin-top:10px;">
+        <button class="wifi-apply" onclick="requestBootLog()">&#8635; Refresh</button>
+      </div>
+    </div>
+  </details>
+</div>
+
 <!-- ── Firmware flash (USB Serial only) ─────────────────────────────────────────
      Hidden by default; revealed by JS only when flasher.js loaded (i.e. the page
      is served from GitHub Pages / a local file, not from the ESP's own web
@@ -1602,8 +1638,64 @@ function handleInboundMessage(msg) {
   if      (msg.e === 'cfg')            applyCfg(msg);
   else if (msg.e === 'chdata')         handleChData(msg);
   else if (msg.e === 'wifi_switching') handleWifiSwitching(msg);
+  else if (msg.e === 'bootlog')        handleBootLog(msg);
   else if (msg.t === 'pong')           handlePong(msg);
 }
+
+// ── Diagnostics: boot history ───────────────────────────────────────────────
+// The board keeps its reset history in RTC RAM (see buildBootLogJson in the
+// firmware) precisely because the serial banner is unreadable while this page
+// owns the USB port.  Pulled on connect so an abnormal reset is flagged in the
+// header even with the panel closed.
+function requestBootLog() { send({ t: 'bootlog' }); }
+
+const _fmtRan = (ms) => !ms ? '—'
+  : ms < 60000 ? (ms / 1000).toFixed(1) + ' s'
+  : Math.floor(ms / 60000) + 'm ' + Math.round((ms % 60000) / 1000) + 's';
+
+function handleBootLog(msg) {
+  const sum = document.getElementById('diag-summary');
+  const wrap = document.getElementById('diag-log-wrap');
+  const tb   = document.querySelector('#diag-log tbody');
+  if (!sum || !tb) return;
+
+  // reason 1 = ESP_RST_POWERON. Anything else means the board restarted on its
+  // own, which is the case worth shouting about.
+  const abnormal = msg.rst !== 1;
+  const colour   = abnormal ? 'var(--yellow)' : 'var(--green)';
+  sum.innerHTML =
+    `<div>Last reset &nbsp;<b style="color:${colour};">${msg.rstn || '?'}</b>` +
+    `<span style="color:var(--muted);"> (code ${msg.rst}, RTC ${msg.rtc0})</span></div>` +
+    `<div style="color:var(--muted);">Boots since power applied <b style="color:var(--text);">${msg.n}</b>` +
+    ` &nbsp;·&nbsp; previous boot ran <b style="color:var(--text);">${_fmtRan(msg.prev)}</b>` +
+    ` &nbsp;·&nbsp; up now <b style="color:var(--text);">${_fmtRan(msg.up)}</b></div>`;
+
+  tb.innerHTML = '';
+  (msg.log || []).forEach((b, i) => {
+    const tr = document.createElement('tr');
+    tr.style.borderTop = '1px solid var(--border)';
+    tr.innerHTML =
+      `<td style="padding:4px 8px;color:var(--muted);">${i === 0 ? 'now' : '-' + i}</td>` +
+      `<td style="padding:4px 8px;color:${b.r === 1 ? 'var(--text)' : 'var(--yellow)'};">${b.rn}</td>` +
+      `<td style="padding:4px 8px;color:var(--muted);">${b.rtc0}</td>` +
+      `<td style="padding:4px 8px;">${_fmtRan(b.ran)}</td>`;
+    tb.appendChild(tr);
+  });
+  wrap.style.display = (msg.log && msg.log.length) ? 'block' : 'none';
+
+  // Nudge the user toward the panel when the board restarted by itself, and
+  // count repeats — an intermittent fault is easy to miss one event at a time.
+  if (abnormal) {
+    _diagResetCount++;
+    const d = document.getElementById('diagDetails');
+    const s = d && d.querySelector('summary');
+    if (s) {
+      s.innerHTML = `Diagnostics <span style="color:var(--yellow);font-weight:600;">` +
+                    `⚠ ${msg.rstn}${_diagResetCount > 1 ? ` (×${_diagResetCount} this session)` : ''}</span>`;
+    }
+  }
+}
+let _diagResetCount = 0;   // abnormal resets seen since the page was loaded
 
 // PONG receipt = the firmware is alive and speaks our cfg version.  We don't
 // currently surface this to the UI beyond logging, but it's the hook for
@@ -1679,7 +1771,7 @@ async function checkFirmwareVersion(forceFetch) {
 // page the token is never replaced, so we fall back to "dev". Compare this
 // (latest build) against the header's FW version (what's on the board) to see
 // whether the board needs a flash.
-const UI_VERSION = '27.14:40.R.JUL.2026';
+const UI_VERSION = '11.19:01.R.AUG.2026';
 function initFooterVersion() {
   const el = document.getElementById('footer-ui-version');
   if (el) el.textContent = UI_VERSION.startsWith('__') ? 'dev' : UI_VERSION;
@@ -1696,12 +1788,22 @@ function _isEspHosted() {
   return true;
 }
 
+// Single onstate sink for every transport.  Paints the badge, and on each
+// (re)connect pulls the board's boot history — that's what turns an
+// intermittent self-reset into something you can actually see: the board
+// restarts, the transport reconnects, and the new reset reason lands in the
+// Diagnostics panel with the session counter bumped.
+function onTransportState(on, detail) {
+  setBadge(on, detail);
+  if (on) requestBootLog();
+}
+
 // Backwards-compat entry points — every existing call site that does
 // connect() or send({...}) still works; they just flow through the transport.
 function connect() {
   if (!transport) transport = _isEspHosted() ? new WsTransport() : new SerialTransport();
   transport.onmessage = handleInboundMessage;
-  transport.onstate   = setBadge;
+  transport.onstate   = onTransportState;
   _updateTransportBtn();
   // Auto-open WiFi only.  Web Serial's navigator.serial.requestPort() requires
   // a user gesture (security) so SerialTransport waits for the user to click
@@ -1782,7 +1884,7 @@ async function chooseTransport(kind) {
   setBadge(false);                                     // immediate visual feedback
   transport = (kind === 'serial') ? new SerialTransport() : new WsTransport();
   transport.onmessage = handleInboundMessage;
-  transport.onstate   = setBadge;
+  transport.onstate   = onTransportState;
   _updateTransportBtn();
   transport.open();
 }
@@ -1824,7 +1926,7 @@ async function reopenAfterFlash(p) {
     try {
       const t = new SerialTransport();
       t.onmessage = handleInboundMessage;
-      t.onstate   = setBadge;
+      t.onstate   = onTransportState;
       transport = t;
       _updateTransportBtn();
       const before = _lastPongMs;

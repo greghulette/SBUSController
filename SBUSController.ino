@@ -998,9 +998,11 @@ static void broadcastJson(const String& msg) {
   serialOutboxPump();
 }
 
+static String buildBootLogJson();   // defined with the boot telemetry, further down
+
 // wsClient = the WebSocket client this command arrived on, or nullptr when it
-// came in over Serial.  Only PING needs to know: its reply is addressed back to
-// the asking client rather than broadcast.
+// came in over Serial.  PING and BOOTLOG need to know: their replies are
+// addressed back to the asking client rather than broadcast.
 void processCommandJson(const char* json, AsyncWebSocketClient* wsClient) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) return;
@@ -1046,6 +1048,19 @@ void processCommandJson(const char* json, AsyncWebSocketClient* wsClient) {
   // if the implicit post-save broadcast was missed.
   if (!strcmp(t, "getcfg")) {
     broadcastJson(buildCfgJson());
+    return;
+  }
+
+  // ── BOOTLOG — the RTC boot-history ring (Diagnostics panel) ───────────────
+  // Answered point-to-point like PING: it's a reply to one asker, not state
+  // every client needs.  This is the whole point of the ring — it makes the
+  // reset history readable over the same link the UI is already using, instead
+  // of needing a serial terminal the UI is currently occupying.
+  if (!strcmp(t, "bootlog")) {
+    String resp = buildBootLogJson();
+    if (wsClient) { wsClient->text(resp); return; }
+    serialEnqueueLine(resp.c_str(), resp.length());
+    serialOutboxPump();
     return;
   }
 
@@ -1524,32 +1539,113 @@ static void printBootloaderInfo() {
 RTC_NOINIT_ATTR static uint32_t g_bootMagic;
 RTC_NOINIT_ATTR static uint32_t g_bootAttempts;
 
+// ── Boot history ring ───────────────────────────────────────────────────────
+// The reset banner below only ever reached a serial terminal — useless when the
+// USB port is occupied by the Web Serial UI, which is exactly the case while
+// the board is being driven.  So the same facts also go into RTC noinit RAM
+// (survives every reset short of true power loss) and are served to the browser
+// on request, letting you read the history of an INTERMITTENT reset after the
+// fact instead of having to be watching a terminal at the moment it happens.
+//
+// `ranMs` — how long the boot BEFORE this record survived — is the single most
+// diagnostic field: a board that always dies at a similar uptime is a very
+// different fault from one that dies at random intervals.
+#define BOOT_LOG_N 8
+struct BootRec {
+  uint8_t  reason;    // esp_reset_reason_t of the boot that FOLLOWED the death
+  uint8_t  rtc0;      // rtc_get_reset_reason(0) — low-level per-core cause
+  uint16_t _pad;
+  uint32_t ranMs;     // uptime the previous boot reached, 0 = unknown/power-on
+};
+RTC_NOINIT_ATTR static BootRec  g_bootLog[BOOT_LOG_N];
+RTC_NOINIT_ATTR static uint32_t g_bootLogCount;   // total records ever written
+RTC_NOINIT_ATTR static uint32_t g_upMs;           // live uptime stamp, refreshed 1 Hz by loop()
+
+// This boot's cause, kept for buildCfgJson() so the UI can show it on connect.
+static esp_reset_reason_t g_thisReset  = ESP_RST_UNKNOWN;
+static int                g_thisRtc0   = 0;
+static uint32_t           g_prevRanMs  = 0;       // uptime the previous boot reached
+
+static const char* resetReasonName(int r) {
+  switch ((esp_reset_reason_t)r) {
+    case ESP_RST_POWERON:  return "Power-on / EN reset";
+    case ESP_RST_SW:       return "Software restart (incl. boot-guard retry)";
+    case ESP_RST_PANIC:    return "Crash (panic)";
+    case ESP_RST_INT_WDT:  return "Interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "Task watchdog";
+    case ESP_RST_WDT:      return "RTC watchdog (short-WDT bootloader fired)";
+    case ESP_RST_BROWNOUT: return "BROWNOUT — supply rail sagged";
+    default:               return "other";
+  }
+}
+
 static void printBootTelemetry() {
   esp_reset_reason_t r = esp_reset_reason();
-  const char *name = "other";
-  switch (r) {
-    case ESP_RST_POWERON:  name = "Power-on / EN reset"; break;
-    case ESP_RST_SW:       name = "Software restart (incl. boot-guard retry)"; break;
-    case ESP_RST_PANIC:    name = "Crash (panic)"; break;
-    case ESP_RST_INT_WDT:  name = "Interrupt watchdog"; break;
-    case ESP_RST_TASK_WDT: name = "Task watchdog"; break;
-    case ESP_RST_WDT:      name = "RTC watchdog (short-WDT bootloader fired)"; break;
-    case ESP_RST_BROWNOUT: name = "BROWNOUT — supply rail sagged"; break;
-    default: break;
-  }
+  const char *name = resetReasonName((int)r);
+  g_thisReset = r;
+  g_thisRtc0  = (int)rtc_get_reset_reason(0);
+
   // Low-level per-core causes (rom/rtc.h). Key S3 codes:
   //   1 = power-on   15 = RTC-WDT brown-out   16 = RTC-WDT system reset
   //   (16 = the short-WDT bootloader's 3 s watchdog fired — auto-retry)
   Serial.printf("Reset reason: %d - %s  (RTC codes core0=%d core1=%d)\n",
                 (int)r, name, (int)rtc_get_reset_reason(0), (int)rtc_get_reset_reason(1));
+
+  // Read the previous boot's last uptime stamp BEFORE the power-loss check
+  // clears it — after a true power loss the RTC RAM is garbage, so it's only
+  // meaningful when the magic word survived.
+  g_prevRanMs = (g_bootMagic == BOOT_MAGIC) ? g_upMs : 0;
+
   if (g_bootMagic != BOOT_MAGIC) {          // true power loss → fresh count
     g_bootMagic = BOOT_MAGIC;
     g_bootAttempts = 0;
+    g_bootLogCount = 0;
+    memset(g_bootLog, 0, sizeof(g_bootLog));
   }
   g_bootAttempts++;
+  g_upMs = 0;                                // restart the uptime stamp for this boot
+
+  BootRec &rec = g_bootLog[g_bootLogCount % BOOT_LOG_N];
+  rec.reason = (uint8_t)r;
+  rec.rtc0   = (uint8_t)g_thisRtc0;
+  rec._pad   = 0;
+  rec.ranMs  = g_prevRanMs;
+  g_bootLogCount++;
+
   Serial.printf("Boot attempts since power applied: %lu%s\n",
                 (unsigned long)g_bootAttempts,
                 g_bootAttempts > 1 ? "   <-- board retried/reset before this boot" : "");
+  if (g_prevRanMs)
+    Serial.printf("Previous boot ran for %lu.%03lu s before it died\n",
+                  (unsigned long)(g_prevRanMs / 1000), (unsigned long)(g_prevRanMs % 1000));
+}
+
+// {"e":"bootlog", …} — the RTC ring, newest first, for the UI's Diagnostics
+// panel.  Same facts as the serial banner, reachable while the Web Serial UI
+// owns the port.
+static String buildBootLogJson() {
+  JsonDocument doc;
+  doc["e"]    = "bootlog";
+  doc["rst"]  = (int)g_thisReset;
+  doc["rstn"] = resetReasonName((int)g_thisReset);
+  doc["rtc0"] = g_thisRtc0;
+  doc["n"]    = g_bootAttempts;
+  doc["prev"] = g_prevRanMs;
+  doc["up"]   = millis();
+  JsonArray arr = doc["log"].to<JsonArray>();
+  // Walk backwards from the newest record; stop at however many we really have.
+  uint32_t have = g_bootLogCount < BOOT_LOG_N ? g_bootLogCount : BOOT_LOG_N;
+  for (uint32_t i = 0; i < have; i++) {
+    const BootRec &b = g_bootLog[(g_bootLogCount - 1 - i) % BOOT_LOG_N];
+    JsonObject o = arr.add<JsonObject>();
+    o["r"]    = b.reason;
+    o["rn"]   = resetReasonName(b.reason);
+    o["rtc0"] = b.rtc0;
+    o["ran"]  = b.ranMs;
+  }
+  String out;
+  serializeJson(doc, out);
+  return out;
 }
 
 void setup() {
@@ -1810,6 +1906,13 @@ void loop() {
     lastFrameMs = now;
     transmitSbus();
   }
+
+  // Stamp uptime into RTC noinit RAM once a second.  A reset never gets to run
+  // cleanup code, so this leaves behind the only record of how far the board
+  // got — the next boot reads it as "previous boot ran for N ms".  1 Hz keeps
+  // it free next to the 9 ms SBUS cadence and bounds the error to 1 s.
+  static uint32_t s_upStampMs = 0;
+  if (now - s_upStampMs >= 1000) { s_upStampMs = now; g_upMs = now; }
 
   ws.cleanupClients();
 }

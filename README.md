@@ -47,6 +47,34 @@ bootloader is committed once (fixed name) and left untouched by CI. See
 > board doesn't serve `flasher.js`, and esptool needs a direct serial port) —
 > use the hosted page over USB.
 
+## Diagnostics — why the board restarted
+
+The UI has a **Diagnostics** section showing the board's reset history: the last
+reset reason, how many boots have happened since power was applied, and how long
+each previous boot survived before it died. It works on both transports.
+
+The board keeps this in RTC RAM, which survives every reset except actually
+losing power. That matters because the same facts are printed to the serial
+console at boot, and the console is unreadable whenever the UI is connected over
+USB Serial — the page owns the port. Reading it over the link instead means an
+intermittent self-reset can be diagnosed after the fact rather than requiring a
+terminal to be attached at the moment it happens.
+
+The panel header flags an abnormal reset and counts repeats for the session, so
+a board resetting every few minutes is obvious without watching for it.
+
+| Reset reason | Usually means |
+|---|---|
+| `Power-on / EN reset` | normal — power applied, or the reset button |
+| `BROWNOUT` | supply rail sagged; check power, not firmware |
+| `Task watchdog` / `Interrupt watchdog` | something blocked the loop past its deadline |
+| `RTC watchdog` | the short-WDT bootloader's 3 s timer fired during early boot |
+| `Crash (panic)` | firmware fault |
+| `Software restart` | a deliberate `ESP.restart()` — includes the boot-guard retry |
+
+**Ran for** is the most diagnostic field. A consistent figure points at something
+in the firmware; a random one usually means power.
+
 ## Hardware
 
 Target: **ESP32-S3** on a WCB HW 3.2 board.
