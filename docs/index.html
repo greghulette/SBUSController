@@ -1347,7 +1347,11 @@ class Transport {
   }
   open()           { /* override */ }
   close()          { /* override */ }
-  send(_obj)       { /* override */ }
+  // Returns TRUE only if the message actually went out.  Callers that change
+  // saved state (wifiApply, saveConfig) must check it — a send that silently
+  // evaporates while the link is down looks exactly like a save that didn't
+  // stick, which is far worse than an error message.
+  send(_obj)       { return false; }
   isConnected()    { return false; }
   probe()          { /* override — force an immediate liveness check */ }
 }
@@ -1393,7 +1397,9 @@ class WsTransport extends Transport {
     this.ws = null;
   }
   send(obj) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj));
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    this.ws.send(JSON.stringify(obj));
+    return true;
   }
   isConnected() { return this.ws && this.ws.readyState === WebSocket.OPEN; }
 
@@ -1609,13 +1615,14 @@ class SerialTransport extends Transport {
   }
 
   send(obj) {
-    if (!this.writer || !this.connected) return;
+    if (!this.writer || !this.connected) return false;
     const text = JSON.stringify(obj) + '\n';
     // Fire-and-forget — keeps send() synchronous to match WsTransport's shape.
     // Errors here usually mean the port has been unplugged; the read loop
     // will see the EOF and trigger onstate(false) shortly after.
     this.writer.write(new TextEncoder().encode(text))
       .catch(err => console.error('[SerialTransport] write failed:', err));
+    return true;
   }
 
   // Port is open but has gone silent (suspend, wedged board, half-dead CDC).
@@ -1677,6 +1684,29 @@ const _fmtRan = (ms) => !ms ? '—'
   : ms < 60000 ? (ms / 1000).toFixed(1) + ' s'
   : Math.floor(ms / 60000) + 'm ' + Math.round((ms % 60000) / 1000) + 's';
 
+// Serial-link forensics row. Only meaningful on the USB transport, and only
+// worth showing once there's history to read.
+//
+// The board can't reboot its way out of a dead USB link — it stays up, which is
+// exactly why the reset log alone can't explain a dropped connection. The
+// longest inbound-silence gap can: the UI pings every LINK_PING_MS, so on a
+// healthy link the gap sits just above that. A gap that matches an outage you
+// actually saw means inbound died too (host-side USB stall, nothing the
+// firmware can do). A gap that stayed small through the outage means the board
+// kept hearing us and only its replies were lost.
+function _diagSerialLine(msg) {
+  if (msg.sgap == null || !(transport instanceof SerialTransport)) return '';
+  const gap  = msg.sgap;
+  const bad  = gap > LINK_TIMEOUT_MS;
+  const verdict = !bad
+    ? 'inbound never stalled'
+    : 'inbound stalled too &mdash; host-side USB stall';
+  return `<div style="color:var(--muted);">Serial link &nbsp;longest inbound gap ` +
+         `<b style="color:${bad ? 'var(--yellow)' : 'var(--green)'};">${_fmtRan(gap)}</b>` +
+         ` <span style="color:var(--muted);">(${verdict})</span>` +
+         ` &nbsp;·&nbsp; pings answered <b style="color:var(--text);">${msg.spng}</b></div>`;
+}
+
 function handleBootLog(msg) {
   const sum = document.getElementById('diag-summary');
   const wrap = document.getElementById('diag-log-wrap');
@@ -1692,7 +1722,8 @@ function handleBootLog(msg) {
     `<span style="color:var(--muted);"> (code ${msg.rst}, RTC ${msg.rtc0} ${msg.rtcn || ''})</span></div>` +
     `<div style="color:var(--muted);">Boots since power applied <b style="color:var(--text);">${msg.n}</b>` +
     ` &nbsp;·&nbsp; previous boot ran <b style="color:var(--text);">${_fmtRan(msg.prev)}</b>` +
-    ` &nbsp;·&nbsp; up now <b style="color:var(--text);">${_fmtRan(msg.up)}</b></div>`;
+    ` &nbsp;·&nbsp; up now <b style="color:var(--text);">${_fmtRan(msg.up)}</b></div>` +
+    _diagSerialLine(msg);
 
   tb.innerHTML = '';
   (msg.log || []).forEach((b, i) => {
@@ -1795,7 +1826,7 @@ async function checkFirmwareVersion(forceFetch) {
 // page the token is never replaced, so we fall back to "dev". Compare this
 // (latest build) against the header's FW version (what's on the board) to see
 // whether the board needs a flash.
-const UI_VERSION = '11.19:25.R.AUG.2026';
+const UI_VERSION = '03.12:57.R.SEP.2026';
 function initFooterVersion() {
   const el = document.getElementById('footer-ui-version');
   if (el) el.textContent = UI_VERSION.startsWith('__') ? 'dev' : UI_VERSION;
@@ -1834,7 +1865,7 @@ function connect() {
   // "USB Serial" in the picker — which provides that gesture.
   if (transport instanceof WsTransport) transport.open();
 }
-function send(obj) { if (transport) transport.send(obj); }
+function send(obj) { return transport ? !!transport.send(obj) : false; }
 
 // ── Wake-up probes ──────────────────────────────────────────────────────────
 // The heartbeat watchdog catches a dead link on its own, but it can't run while
@@ -2671,7 +2702,10 @@ function applyCfg(msg) {
   if (Array.isArray(msg.pwm)) cfg.pwm = msg.pwm;
   if (msg.pwmExt != null) cfg.pwmExt = !!msg.pwmExt;
   // WiFi
-  if (Array.isArray(msg.wifiNets)) cfg.wifiNets = msg.wifiNets;
+  // Don't overwrite the list the user is part-way through editing — a cfg
+  // broadcast can land at any time (another client saving, a reconnect, the
+  // getcfg after Save Config) and would otherwise erase typed credentials.
+  if (Array.isArray(msg.wifiNets) && !_wifiDirty) cfg.wifiNets = msg.wifiNets;
   if (msg.wifiPref  != null) cfg.wifiPref  = msg.wifiPref;
   if (msg.wifiNet   != null) cfg.wifiNet   = msg.wifiNet;
   if (msg.wifiIP    != null) cfg.wifiIP    = msg.wifiIP;
@@ -3482,7 +3516,17 @@ function renderSettings() {
 //  WiFi panel
 // =============================================================================
 
-function renderWifiPanel() {
+// Set as soon as the user touches an SSID/password field, cleared once the
+// list has been sent to the board.  While it's set, an inbound cfg broadcast
+// must NOT rebuild these rows: the typed text lives in the DOM until Save, and
+// a re-render would silently wipe credentials mid-entry — which reads exactly
+// like "the page won't let me add a network".
+let _wifiDirty = false;
+
+// force=true rebuilds the rows even when dirty.  Only the row-editing buttons
+// pass it, and they call wifiCollect(true) first so the rebuild is seeded from
+// what's actually on screen rather than from stale model state.
+function renderWifiPanel(force) {
   // Status bar
   const nets = cfg.wifiNets || [];
   const ni   = cfg.wifiNet != null ? cfg.wifiNet : -1;
@@ -3491,7 +3535,8 @@ function renderWifiPanel() {
   document.getElementById('wifiStatusIP').textContent   = cfg.wifiIP   || '—';
   document.getElementById('wifiStatusMDNS').textContent = cfg.wifiMDNS || '—';
 
-  // Network rows
+  // Network rows — never clobber in-progress edits (see _wifiDirty).
+  if (_wifiDirty && !force) return;
   const list = document.getElementById('wifiNetList');
   list.innerHTML = '';
   nets.forEach((net, i) => {
@@ -3502,10 +3547,12 @@ function renderWifiPanel() {
     const num  = document.createElement('span'); num.className='drag-num'; num.textContent=i+1+'.';
     const ssid = document.createElement('input'); ssid.type='text'; ssid.placeholder='SSID';
     ssid.value = net.s || ''; ssid.maxLength = 32;
+    ssid.oninput = () => { _wifiDirty = true; };
 
     const passWrap = document.createElement('div'); passWrap.className='wifi-pass-wrap';
     const pass = document.createElement('input'); pass.type='password'; pass.placeholder='Password';
     pass.value = net.p || ''; pass.maxLength = 64;
+    pass.oninput = () => { _wifiDirty = true; };
     const eye  = document.createElement('button'); eye.textContent='👁'; eye.title='Show/hide';
     eye.onclick = () => { pass.type = pass.type==='password' ? 'text' : 'password'; };
     passWrap.appendChild(pass); passWrap.appendChild(eye);
@@ -3513,9 +3560,14 @@ function renderWifiPanel() {
     const up  = document.createElement('button'); up.className='wifi-arrow';  up.textContent='▲';
     const dn  = document.createElement('button'); dn.className='wifi-arrow';  dn.textContent='▼';
     const del = document.createElement('button'); del.className='wifi-del';   del.textContent='✕';
-    up.onclick  = () => { if(i>0){const t=nets[i];nets[i]=nets[i-1];nets[i-1]=t;renderWifiPanel();} };
-    dn.onclick  = () => { if(i<nets.length-1){const t=nets[i];nets[i]=nets[i+1];nets[i+1]=t;renderWifiPanel();} };
-    del.onclick = () => { nets.splice(i,1); renderWifiPanel(); };
+    // Re-read the on-screen values first, so reordering or deleting one row
+    // doesn't discard text typed into the others.
+    up.onclick  = () => { wifiCollect(true); const n=cfg.wifiNets;
+                          if(i>0){const t=n[i];n[i]=n[i-1];n[i-1]=t;_wifiDirty=true;renderWifiPanel(true);} };
+    dn.onclick  = () => { wifiCollect(true); const n=cfg.wifiNets;
+                          if(i<n.length-1){const t=n[i];n[i]=n[i+1];n[i+1]=t;_wifiDirty=true;renderWifiPanel(true);} };
+    del.onclick = () => { wifiCollect(true); cfg.wifiNets.splice(i,1);
+                          _wifiDirty=true; renderWifiPanel(true); };
 
     row.appendChild(num); row.appendChild(ssid); row.appendChild(passWrap);
     row.appendChild(up);  row.appendChild(dn);   row.appendChild(del);
@@ -3537,32 +3589,53 @@ function renderWifiPanel() {
 }
 
 function wifiAddRow() {
-  if (!cfg.wifiNets) cfg.wifiNets = [];
+  wifiCollect(true);                       // keep what's already typed on screen
   // Cap matches MAX_WIFI_NETS in firmware (8).  Firmware would silently drop
-  // anything beyond, so we stop the user here for clarity.
-  if (cfg.wifiNets.length >= 8) return;
+  // anything beyond, so we stop the user here — and say so, rather than having
+  // the button do nothing.
+  if (cfg.wifiNets.length >= 8) {
+    const msg = document.getElementById('wifiMsg');
+    msg.style.display = 'inline';
+    msg.style.color = 'var(--yellow)';
+    msg.textContent = 'Maximum of 8 networks — delete one first.';
+    return;
+  }
   cfg.wifiNets.push({s:'', p:''});
-  renderWifiPanel();
+  _wifiDirty = true;
+  renderWifiPanel(true);
 }
 
-// Read current row values back into cfg.wifiNets before sending
-function wifiCollect() {
+// Read current row values back into cfg.wifiNets.
+// keepEmpty=true retains rows that have no SSID yet — needed for UI-side edits
+// (add / delete / reorder) so a half-filled row isn't dropped out from under
+// the user.  The send path omits it, because the firmware ignores a blank SSID.
+function wifiCollect(keepEmpty) {
   const rows = document.getElementById('wifiNetList').children;
-  cfg.wifiNets = [];
+  const out = [];
   for (const row of rows) {
     const inputs = row.querySelectorAll('input');
     const s = inputs[0].value.trim();
     const p = inputs[1].value;
-    if (s) cfg.wifiNets.push({s, p});
+    if (s || keepEmpty) out.push({s, p});
   }
+  cfg.wifiNets = out;
 }
 
 function wifiApply() {
-  wifiCollect();
-  cfg.wifiPref = parseInt(document.getElementById('wifiPrefSel').value) || 0;
-  send({t:'wificfg', pref: cfg.wifiPref, nets: cfg.wifiNets});
   const msg = document.getElementById('wifiMsg');
   msg.style.display = 'inline';
+  wifiCollect();
+  cfg.wifiPref = parseInt(document.getElementById('wifiPrefSel').value) || 0;
+  // A send that can't go out used to fail silently, leaving "Connecting…" on
+  // screen and the network unsaved — indistinguishable from a save that didn't
+  // stick. Report it instead, and keep the rows dirty so nothing is lost.
+  if (!send({t:'wificfg', pref: cfg.wifiPref, nets: cfg.wifiNets})) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = 'Not connected — nothing was sent. Reconnect, then Save again.';
+    return;
+  }
+  _wifiDirty = false;                      // the board owns the list now
+  msg.style.color = '';
   msg.textContent = 'Connecting…';
 }
 
@@ -3679,6 +3752,9 @@ function importConfig(input) {
       // pre-import state.  An explicit getcfg afterwards guarantees the UI
       // catches up to what's actually saved (delay sits after the wificfg
       // follow-up above so it reflects the networks too).
+      // An import deliberately replaces the whole list, so drop the edit guard
+      // and let the refresh below repaint the rows from what was imported.
+      _wifiDirty = false;
       setTimeout(() => send({t:'getcfg'}), 450);
       status.style.color = 'var(--green)';
       status.textContent = '\u2713 Imported — config applied & saved.';
@@ -3750,7 +3826,11 @@ function saveConfig() {
   }));
   payload.pwmExt = document.getElementById('pwmExtChk').checked;
 
-  send(payload);
+  if (!send(payload)) {
+    alert('Not connected to the board — nothing was saved.\n\n' +
+          'Reconnect (the button in the header), then Save Config again.');
+    return;
+  }
   // Same belt-and-suspenders as importConfig — guarantee the UI re-syncs to
   // what the firmware actually saved, even if the implicit post-save broadcast
   // happens to be missed.

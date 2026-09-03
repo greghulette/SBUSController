@@ -639,9 +639,20 @@ void saveConfig() {
   }
   doc["pwmExt"] = cfg.pwmExtended;
 
-  serializeJson(doc, f);
+  // Check the write. A full or failing LittleFS returns short here, leaving a
+  // TRUNCATED file that won't parse on the next boot — every setting silently
+  // reverts to defaults. Saying "Config saved." on top of that turns a storage
+  // problem into a phantom "my changes don't stick" bug.
+  size_t written = serializeJson(doc, f);
+  size_t expected = measureJson(doc);
   f.close();
-  Serial.println("[SBUS] Config saved.");
+  if (written != expected) {
+    Serial.printf("[SBUS] CONFIG SAVE FAILED — wrote %u of %u bytes (filesystem full?). "
+                  "Saved settings are now incomplete.\n",
+                  (unsigned)written, (unsigned)expected);
+    return;
+  }
+  Serial.printf("[SBUS] Config saved (%u bytes).\n", (unsigned)written);
 }
 
 String buildCfgJson() {
@@ -808,6 +819,18 @@ static void serialOutboxPump() {
     if (len) { g_serialOutbox = ""; g_serialOutboxOff = 0; }
     return;
   }
+  // Do NOT write while the CDC peripheral considers itself disconnected.
+  // HWCDC::write() latches `connected = false` after tx_timeout_ms (100 ms) of
+  // a host that isn't draining, and from then on every write takes the
+  // !isCDC_Connected() branch, hands the bytes to flushTXBuffer() — which
+  // DISCARDS them — and still returns the full size. availableForWrite() never
+  // consults that flag, so without this guard the pump cheerfully "sends" into
+  // the void and advances g_serialOutboxOff, destroying queued JSON silently.
+  // Bailing here keeps the data queued until the link genuinely comes back.
+  // (Reading `Serial` calls isCDC_Connected(), which also flushes the TX FIFO —
+  // a harmless nudge toward recovery.  The RX path re-arms `connected` on the
+  // next inbound byte, so a host that is still sending recovers on its own.)
+  if (!Serial) return;
   int avail = Serial.availableForWrite();
   if (avail <= 0) return;
   size_t pending = len - g_serialOutboxOff;
@@ -976,6 +999,13 @@ static const   size_t MAX_JSON_LINE = 12288;  // cfg payload with 45 Lua buttons
 // is watching the serial monitor.
 static uint32_t g_serialHostLastSeenMs = 0;
 static const uint32_t SERIAL_HOST_TTL_MS = 5000;   // PING refresh window
+
+// Serial-link forensics — see the block comment in handleSerialCommands().
+// Plain RAM, not RTC: these describe the CURRENT boot's link, and the whole
+// point is that the board does NOT reset when this fault happens.
+static uint32_t g_serialLastRxMs    = 0;   // millis() of the last inbound serial byte
+static uint32_t g_serialMaxRxGapMs  = 0;   // longest silence between inbound bytes
+static uint32_t g_serialPingCount   = 0;   // PINGs answered on the serial transport
 static inline bool serialHostAlive() {
   return g_serialHostLastSeenMs && (millis() - g_serialHostLastSeenMs) < SERIAL_HOST_TTL_MS;
 }
@@ -1034,6 +1064,7 @@ void processCommandJson(const char* json, AsyncWebSocketClient* wsClient) {
     // never interleave into the middle of a partially-drained JSON line (e.g.
     // a cfg dump in flight).
     g_serialHostLastSeenMs = millis();
+    g_serialPingCount++;
     serialEnqueueLine(resp.c_str(), resp.length());
     serialOutboxPump();
     return;
@@ -1675,6 +1706,9 @@ static String buildBootLogJson() {
   doc["n"]    = g_bootAttempts;
   doc["prev"] = g_prevRanMs;
   doc["up"]   = millis();
+  // Serial-link forensics (meaningless over WiFi — the UI hides them there).
+  doc["sgap"] = g_serialMaxRxGapMs;
+  doc["spng"] = g_serialPingCount;
   JsonArray arr = doc["log"].to<JsonArray>();
   // Walk backwards from the newest record; stop at however many we really have.
   uint32_t have = g_bootLogCount < BOOT_LOG_N ? g_bootLogCount : BOOT_LOG_N;
@@ -1801,6 +1835,24 @@ void setup() {
 // =============================================================================
 
 static void handleSerialCommands() {
+  // ── Serial RX gap tracking ────────────────────────────────────────────────
+  // When the USB link dies while the board stays up, this is what tells the two
+  // possible failures apart afterwards:
+  //   small max gap  → the board kept RECEIVING throughout, so only the
+  //                    device→host direction was dead (the HWCDC `connected`
+  //                    latch described in serialOutboxPump)
+  //   large max gap  → inbound stopped too, so the whole CDC pipe wedged on the
+  //                    host side and there is nothing the firmware could do
+  // The UI's ping is a steady 3 s heartbeat, so on a healthy link the max gap
+  // sits just above 3 s and any real outage stands out immediately.
+  if (Serial.available()) {
+    uint32_t now = millis();
+    if (g_serialLastRxMs) {
+      uint32_t gap = now - g_serialLastRxMs;
+      if (gap > g_serialMaxRxGapMs) g_serialMaxRxGapMs = gap;
+    }
+    g_serialLastRxMs = now;
+  }
   while (Serial.available()) {
     char c = (char)Serial.read();
 
