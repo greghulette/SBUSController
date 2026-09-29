@@ -128,6 +128,24 @@ bool g_sbus24 = true;
 inline int sbusChCount()  { return g_sbus24 ? SBUS_CH_COUNT_24 : SBUS_CH_COUNT_16; }
 inline int sbusFrameLen() { return g_sbus24 ? SBUS_FRAME_LEN_24 : SBUS_FRAME_LEN_16; }
 
+// ─── HIL test state (RAM only) ────────────────────────────────────────────────
+// What the test verbs in processCommandJson() change: a real receiver's failsafe
+// and lost-frame flags, a dead link, a malformed burst - things this transmitter
+// never sends on its own, and that the WCB repo's hardware-in-the-loop harness
+// needs to drive NaviCore's SBUS reader through (its docs/hil_plan/NAVICORE.md,
+// INF8). Every one starts at its production value and nothing saves it, so any
+// reset puts the stream back to normal. Written by the command handler (the loop
+// task, or the async WebSocket task) and read by loop(): single-word values.
+static volatile uint8_t g_sbusFlags    = SBUS_FLAGS;  // "flags": the flags byte of every frame
+static volatile bool    g_sbusStream   = true;        // "stream": false stops the frames, no reset
+static volatile int32_t g_streamBudget = -1;          // "stream" + "frames": k frames, then off; -1 = no limit
+
+enum : uint8_t { GLITCH_NONE = 0, GLITCH_TRUNCATE, GLITCH_GARBAGE, GLITCH_DOUBLE, GLITCH_GAP, GLITCH_DIP };
+#define GLITCH_MAX 64                                   // "garbage": at most this many bytes
+static volatile uint8_t  g_glitchKind = GLITCH_NONE;    // "glitch": one burst in place of the next frame
+static volatile uint16_t g_glitchN    = 0;
+static uint8_t           g_glitchBuf[GLITCH_MAX];       // "garbage": its bytes, made when the verb arrives
+
 // ─── SBUS Debug ───────────────────────────────────────────────────────────────
 #define SBUS_DEBUG
 #define SBUS_DEBUG_INTERVAL_MS  50    // serial dump rate (ms) — 50ms = 20 Hz
@@ -748,7 +766,7 @@ void buildSbusFrame(uint8_t* frame) {
   const int chcnt = sbusChCount();
   memset(frame, 0, flen);
   frame[0]        = SBUS_HEADER;
-  frame[flen - 2] = SBUS_FLAGS;
+  frame[flen - 2] = g_sbusFlags;   // SBUS_FLAGS unless a HIL test verb set it
   frame[flen - 1] = SBUS_FOOTER;
   for (int i = 0; i < chcnt; i++) {
     uint16_t val = (uint16_t)constrain((int)sbusChannels[i], 0, 2047);  // 11-bit protocol max
@@ -931,6 +949,47 @@ void transmitSbus() {
   updatePwmOutputs();
 }
 
+// HIL "glitch": the one malformed burst a test asked for, in place of this slot's
+// frame. loop() sends it whether or not the stream is on, so a test can stop the
+// stream, inject the burst alone and then let exactly k good frames through
+// ("stream" with "frames"). Only loop() writes Serial1: a verb that arrives over
+// the WebSocket runs on the async task, which would interleave with a frame.
+static void sendGlitch() {
+  const uint8_t kind = g_glitchKind;
+  const int     flen = sbusFrameLen();
+  int           n    = g_glitchN;
+  g_glitchKind = GLITCH_NONE;
+  uint8_t frame[SBUS_FRAME_LEN_24];
+  switch (kind) {
+    case GLITCH_TRUNCATE:            // the frame's first n bytes, then silence until the next slot
+      buildSbusFrame(frame);
+      if (n >= flen) n = flen - 1;   // the mode changed since the verb: still a partial frame
+      Serial1.write(frame, n);
+      break;
+    case GLITCH_GARBAGE:             // n bytes that hold no header, so no frame can start in them
+      Serial1.write(g_glitchBuf, n);
+      break;
+    case GLITCH_DOUBLE:              // n whole frames back to back, no gap between them
+      buildSbusFrame(frame);
+      for (int k = 0; k < n; k++) Serial1.write(frame, flen);
+      break;
+    case GLITCH_GAP:                 // the frame in two halves, n ms of silence between them
+      buildSbusFrame(frame);
+      Serial1.write(frame, flen / 2);
+      Serial1.flush();               // the first half is on the wire before the silence starts
+      delay(n);
+      Serial1.write(frame + flen / 2, flen - flen / 2);
+      break;
+    case GLITCH_DIP: {               // one whole frame with channel n at 992; the next as before
+      const uint16_t keep = sbusChannels[n - 1];
+      sbusChannels[n - 1] = SBUS_CENTER;
+      transmitSbus();
+      sbusChannels[n - 1] = keep;
+      break;
+    }
+  }
+}
+
 // =============================================================================
 //  AXIS MAPPING
 // =============================================================================
@@ -999,6 +1058,24 @@ static void broadcastJson(const String& msg) {
 }
 
 static String buildBootLogJson();   // defined with the boot telemetry, further down
+
+// The reply to every HIL test verb, addressed to the client that asked, as PONG and
+// BOOTLOG are: whether the verb did what it asked, then the test state after it.
+// Never gated on the ping window: an image without the verbs stays silent (an
+// unknown "t" falls through processCommandJson), and that silence is how the
+// harness tells the two apart. `extra` is appended inside the object: ,"k":v.
+static void sendTestReply(const char* verb, bool ok, AsyncWebSocketClient* wsClient, const char* extra = "") {
+  char buf[320];
+  const int n = snprintf(buf, sizeof(buf),
+    "{\"e\":\"test\",\"t\":\"%s\",\"ok\":%s,\"flags\":%u,\"stream\":%s,\"budget\":%ld,"
+    "\"sbus24\":%s,\"saved24\":%s%s}",
+    verb, ok ? "true" : "false", (unsigned)g_sbusFlags, g_sbusStream ? "true" : "false",
+    (long)g_streamBudget, g_sbus24 ? "true" : "false", cfg.sbus24 ? "true" : "false", extra);
+  if (n <= 0 || n >= (int)sizeof(buf)) return;
+  if (wsClient) { wsClient->text(buf); return; }
+  serialEnqueueLine(buf, (size_t)n);
+  serialOutboxPump();
+}
 
 // wsClient = the WebSocket client this command arrived on, or nullptr when it
 // came in over Serial.  PING and BOOTLOG need to know: their replies are
@@ -1179,8 +1256,21 @@ void processCommandJson(const char* json, AsyncWebSocketClient* wsClient) {
 
   // ── SBUS mode toggle ──────────────────────────────────────────────────────
   // { "t":"mode", "sbus24":bool }
+  // { "t":"mode", "sbus24":bool, "save":false }   HIL test verb: this boot only.
+  // cfg.sbus24 keeps the saved mode, so no later saveConfig() (a "cfg" or "wificfg"
+  // from the UI) can persist the test's; the answer is the test reply, since the cfg
+  // broadcast reports the saved mode. The channels reset exactly as a saved change.
   else if (!strcmp(t, "mode")) {
     bool newMode = doc["sbus24"] | g_sbus24;
+    if (!(doc["save"] | true)) {
+      if (newMode != g_sbus24) {
+        g_sbus24 = newMode;
+        for (int i = 0; i < SBUS_CH_COUNT_24; i++) sbusChannels[i] = SBUS_CENTER;
+        applyAllControls();
+      }
+      sendTestReply("mode", true, wsClient);
+      return;
+    }
     if (newMode != g_sbus24) {
       g_sbus24   = newMode;
       cfg.sbus24 = newMode;
@@ -1200,6 +1290,83 @@ void processCommandJson(const char* json, AsyncWebSocketClient* wsClient) {
     Serial.printf("[SBUS] Debug %s\n", g_sbusDebug ? "ENABLED" : "DISABLED");
     broadcastJson(buildCfgJson());
 #endif
+  }
+
+  // ── HIL test verbs (RAM only; docs/hil_plan/NAVICORE.md INF8 in the WCB repo) ──
+  // None of them saves, and a reset undoes each (see the HIL test state above).
+  // Each answers with sendTestReply(). A verb sent without its value changes
+  // nothing and just answers: {"t":"flags"} is the harness's probe for them.
+  // { "t":"flags", "v":0-255 }   the flags byte of every frame: 0x04 lost frame, 0x08 failsafe
+  else if (!strcmp(t, "flags")) {
+    const bool has = !doc["v"].isNull();
+    const int  v   = doc["v"] | -1;
+    const bool ok  = !has || (v >= 0 && v <= 255);
+    if (has && ok) g_sbusFlags = (uint8_t)v;
+    sendTestReply("flags", ok, wsClient);
+  }
+
+  // { "t":"stream", "on":bool }             frames stop (and start again) without a reset
+  // { "t":"stream", "on":true, "frames":k } k more frames (1-1000), then they stop
+  else if (!strcmp(t, "stream")) {
+    const bool has    = !doc["on"].isNull();
+    const bool budget = !doc["frames"].isNull();
+    const int  k      = doc["frames"] | -1;
+    const bool ok     = !has || !budget || (k >= 1 && k <= 1000);
+    if (has && ok) {
+      const bool on  = doc["on"] | true;
+      g_streamBudget = (on && budget) ? k : -1;
+      g_sbusStream   = on;
+    }
+    sendTestReply("stream", ok, wsClient);
+  }
+
+  // { "t":"ch", "c":1-24, "v":0-2047 }   a raw value, until a control writes that channel again
+  else if (!strcmp(t, "ch")) {
+    const int  c  = doc["c"] | 0;
+    const int  v  = doc["v"] | -1;
+    const bool ok = c >= 1 && c <= SBUS_CH_COUNT_24 && v >= 0 && v <= 2047;
+    if (ok) sbusChannels[c - 1] = (uint16_t)v;
+    char extra[40];
+    snprintf(extra, sizeof(extra), ",\"c\":%d,\"v\":%d", c, v);
+    sendTestReply("ch", ok, wsClient, extra);
+  }
+
+  // { "t":"glitch", "kind":k, "n":i }   one malformed burst in place of the next frame
+  // (sendGlitch; sent even while the stream is off):
+  //   truncate  the frame's first n bytes (1 to its length - 1)
+  //   garbage   n bytes (1-64) of a fixed sequence with no 0x0F in it, echoed as "hex"
+  //   double    n whole frames (2-4) back to back
+  //   gap       the frame in two halves with n ms (2-50) of silence between them
+  //   dip       one frame with channel n (1 to the channel count) at 992
+  else if (!strcmp(t, "glitch")) {
+    const char* k = doc["kind"] | "";
+    const int   n = doc["n"] | 0;
+    uint8_t kind = GLITCH_NONE;
+    if      (!strcmp(k, "truncate") && n >= 1 && n < sbusFrameLen())    kind = GLITCH_TRUNCATE;
+    else if (!strcmp(k, "garbage")  && n >= 1 && n <= GLITCH_MAX)       kind = GLITCH_GARBAGE;
+    else if (!strcmp(k, "double")   && n >= 2 && n <= 4)                kind = GLITCH_DOUBLE;
+    else if (!strcmp(k, "gap")      && n >= 2 && n <= 50)               kind = GLITCH_GAP;
+    else if (!strcmp(k, "dip")      && n >= 1 && n <= sbusChCount())    kind = GLITCH_DIP;
+    char extra[48 + 2 * GLITCH_MAX] = "";
+    if (kind != GLITCH_NONE) {
+      int x = snprintf(extra, sizeof(extra), ",\"kind\":\"%s\",\"n\":%d", k, n);
+      if (kind == GLITCH_GARBAGE) {
+        // xorshift32 from a fixed seed: the same n bytes every time, so a run repeats.
+        uint32_t s = 0x2545F491u;
+        x += snprintf(extra + x, sizeof(extra) - x, ",\"hex\":\"");
+        for (int i = 0; i < n; i++) {
+          s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+          uint8_t b = (uint8_t)(s >> 24);
+          if (b == SBUS_HEADER) b = 0xF0;
+          g_glitchBuf[i] = b;
+          x += snprintf(extra + x, sizeof(extra) - x, "%02X", b);
+        }
+        snprintf(extra + x, sizeof(extra) - x, "\"");
+      }
+      g_glitchN    = (uint16_t)n;
+      g_glitchKind = kind;       // last: loop() reads the kind first
+    }
+    sendTestReply("glitch", kind != GLITCH_NONE, wsClient, extra);
   }
 
   // ── Config save (axis channels + all control channels) ────────────────────
@@ -1948,7 +2115,15 @@ void loop() {
   uint32_t now = millis();
   if (now - lastFrameMs >= SBUS_FRAME_MS) {
     lastFrameMs = now;
-    transmitSbus();
+    if (g_glitchKind != GLITCH_NONE) {
+      sendGlitch();                  // HIL: a malformed burst takes this slot, stream on or off
+    } else if (g_sbusStream) {       // HIL "stream": off stops the frames without a reset
+      transmitSbus();
+      if (g_streamBudget > 0) {      // HIL "stream" + "frames": the budget's last frame stops it
+        g_streamBudget = g_streamBudget - 1;
+        if (g_streamBudget == 0) g_sbusStream = false;
+      }
+    }
   }
 
   // Stamp uptime into RTC noinit RAM once a second.  A reset never gets to run
