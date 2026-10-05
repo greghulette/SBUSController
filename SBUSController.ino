@@ -20,12 +20,14 @@
 //     6 buttons        S1-S6  (matrix; former RB1/RB2 are now switches SI/SJ)
 //
 //  ─── Hardware Wiring ────────────────────────────────────────────────────────
-//   Kyber SBUS input  ←  GPIO 9  (Serial5 TX on WCB v3.x, inverted 100 kbaud 8E2)
+//   SBUS output A     ←  GPIO 9  (Serial5 TX on WCB v3.x, inverted 100 kbaud 8E2)  →  NaviCore on the bench
+//   SBUS output B     ←  GPIO 17 (Serial4 TX on WCB v3.x, inverted 100 kbaud 8E2)  →  Kyber on the bench
 //   RC PWM output 1   ←  GPIO 4  (Serial1 TX on WCB v3.x)
 //   RC PWM output 2   ←  GPIO 6  (Serial2 TX on WCB v3.x)
 //   RC PWM output 3   ←  GPIO 15 (Serial3 TX on WCB v3.x)
-//   RC PWM output 4   ←  GPIO 17 (Serial4 TX on WCB v3.x)
 //   USB               ↔  Serial  (debug @ 115200)
+//   The controls go to output A unless the HIL "route" verb moves them (RAM only): output B
+//   is silent until routed, and A carries its boot-time rest frame while it is not.
 //
 //  ─── Default Channel Map ────────────────────────────────────────────────────
 //   CH1=RX(AIL)  CH2=RY(ELE)  CH3=LY(THR)  CH4=LX(RUD)
@@ -85,12 +87,13 @@
 
 // ─── Pins ─────────────────────────────────────────────────────────────────────
 // WCB v3.x pin assignments (matches wcb_pin_map.cpp v3.2)
-#define SBUS_TX_PIN     9    // Serial5 TX → SBUS output (inverted 100kbaud 8E2)
+#define SBUS_TX_PIN     9    // Serial5 TX → SBUS output A (inverted 100kbaud 8E2)
+#define SBUS_B_TX_PIN   17   // Serial4 TX → SBUS output B (inverted 100kbaud 8E2), formerly RC PWM output 4
 #define PWM_PIN_0       4    // Serial1 TX → RC PWM CH output 1
 #define PWM_PIN_1       6    // Serial2 TX → RC PWM CH output 2
 #define PWM_PIN_2       15   // Serial3 TX → RC PWM CH output 3
-#define PWM_PIN_3       17   // Serial4 TX → RC PWM CH output 4
-#define PWM_CH_COUNT    4
+#define PWM_CH_COUNT    4    // PWM entries in the saved config and the UI: the format is unchanged
+#define PWM_OUT_COUNT   3    // outputs driven: the fourth entry's pin is SBUS output B now
 #define STATUS_LED_PIN  48   // ESP32-S3 onboard RGB NeoPixel (WCB HW 3.2)
 
 // ─── Status LED ───────────────────────────────────────────────────────────────
@@ -145,6 +148,16 @@ enum : uint8_t { GLITCH_NONE = 0, GLITCH_TRUNCATE, GLITCH_GARBAGE, GLITCH_DOUBLE
 static volatile uint8_t  g_glitchKind = GLITCH_NONE;    // "glitch": one burst in place of the next frame
 static volatile uint16_t g_glitchN    = 0;
 static uint8_t           g_glitchBuf[GLITCH_MAX];       // "garbage": its bytes, made when the verb arrives
+
+// "route": which output carries the controls - output A (S5, NaviCore on the bench), output B (S4, the
+// Kyber) or both - so a test can drive one receiver without the other acting on it too. The verbs above
+// act on the routed outputs only. An output that is not routed gets no input: A keeps carrying the rest
+// frame taken at boot (g_restChannels), so NaviCore stays linked and sees nothing move; B stays silent,
+// so the Kyber sees no radio at all, as before output B existed - a frame at the controls' rest values
+// could read as a pad button (992 is within the Kyber's +-50 of button 8's 988).
+enum : uint8_t { ROUTE_A = 1, ROUTE_B = 2 };            // bits: ROUTE_A | ROUTE_B is "both"
+static volatile uint8_t g_route = ROUTE_A;
+static uint16_t         g_restChannels[SBUS_CH_COUNT_24];  // sbusChannels after setup()'s applyAllControls()
 
 // ─── SBUS Debug ───────────────────────────────────────────────────────────────
 #define SBUS_DEBUG
@@ -373,7 +386,7 @@ void initRuntimeState() {
 // =============================================================================
 //  RC PWM outputs  —  50 Hz  (mirrors selected SBUS channels)
 // =============================================================================
-static const uint8_t PWM_PINS[PWM_CH_COUNT] = { PWM_PIN_0, PWM_PIN_1, PWM_PIN_2, PWM_PIN_3 };
+static const uint8_t PWM_PINS[PWM_OUT_COUNT] = { PWM_PIN_0, PWM_PIN_1, PWM_PIN_2 };
 
 // Map SBUS raw value to RC pulse width in microseconds.
 // Standard:  172→1000 µs, 992→1500 µs, 1811→2000 µs  (clamped 1000–2000)
@@ -398,7 +411,7 @@ inline uint32_t pwmUsToDuty(uint32_t us) {
 }
 
 void initPwmOutputs() {
-  for (int i = 0; i < PWM_CH_COUNT; i++) {
+  for (int i = 0; i < PWM_OUT_COUNT; i++) {
     // LEDC: 50 Hz RC PWM, 16-bit resolution (65536 ticks per 20 ms period)
     ledcAttach(PWM_PINS[i], 50, 16);
     // Start at center (1500 µs)
@@ -408,7 +421,7 @@ void initPwmOutputs() {
 }
 
 void updatePwmOutputs() {
-  for (int i = 0; i < PWM_CH_COUNT; i++) {
+  for (int i = 0; i < PWM_OUT_COUNT; i++) {
     uint8_t ch = cfg.pwm[i].ch;
     if (ch >= 1 && ch <= SBUS_CH_COUNT_24) {
       ledcWrite(PWM_PINS[i], pwmUsToDuty(sbusToPwmUs(sbusChannels[ch - 1], cfg.pwmExtended)));
@@ -761,21 +774,46 @@ String buildCfgJson() {
 //  SBUS  —  encode and transmit
 // =============================================================================
 
-void buildSbusFrame(uint8_t* frame) {
+// One frame of `ch` with flags byte `flags`: the controls' (buildSbusFrame) or output A's rest frame.
+void buildSbusFrameFrom(uint8_t* frame, const uint16_t* ch, uint8_t flags) {
   const int flen  = sbusFrameLen();
   const int chcnt = sbusChCount();
   memset(frame, 0, flen);
   frame[0]        = SBUS_HEADER;
-  frame[flen - 2] = g_sbusFlags;   // SBUS_FLAGS unless a HIL test verb set it
+  frame[flen - 2] = flags;
   frame[flen - 1] = SBUS_FOOTER;
   for (int i = 0; i < chcnt; i++) {
-    uint16_t val = (uint16_t)constrain((int)sbusChannels[i], 0, 2047);  // 11-bit protocol max
+    uint16_t val = (uint16_t)constrain((int)ch[i], 0, 2047);  // 11-bit protocol max
     int b = i * 11;
     frame[1 + b / 8]     |= (uint8_t)((val << (b % 8)) & 0xFF);
     frame[1 + b / 8 + 1] |= (uint8_t)((val >> (8 - b % 8)) & 0xFF);
     if ((b % 8) > 5)
       frame[1 + b / 8 + 2] |= (uint8_t)((val >> (16 - b % 8)) & 0xFF);
   }
+}
+
+void buildSbusFrame(uint8_t* frame) {
+  buildSbusFrameFrom(frame, sbusChannels, g_sbusFlags);   // SBUS_FLAGS unless a HIL test verb set it
+}
+
+// Bytes for the routed outputs only (HIL "route"): every frame and glitch the controls make goes
+// through these. Output A is Serial1, output B Serial2; loop() is their only writer.
+static void sbusWriteLive(const uint8_t* buf, size_t n) {
+  if (g_route & ROUTE_A) Serial1.write(buf, n);
+  if (g_route & ROUTE_B) Serial2.write(buf, n);
+}
+
+static void sbusFlushLive() {
+  if (g_route & ROUTE_A) Serial1.flush();
+  if (g_route & ROUTE_B) Serial2.flush();
+}
+
+// Output A while the controls are routed away from it: the boot-time rest frame, flags clear, every slot
+// - stream, glitch and flags verbs act on the routed output, so NaviCore stays linked and at rest.
+static void sendRestFrameA() {
+  uint8_t frame[SBUS_FRAME_LEN_24];
+  buildSbusFrameFrom(frame, g_restChannels, SBUS_FLAGS);
+  Serial1.write(frame, sbusFrameLen());
 }
 
 // =============================================================================
@@ -945,15 +983,16 @@ void transmitSbus() {
   printSbusDebug(frame, flen, chcnt);
   sendWsDebug(frame, flen, chcnt);
 #endif
-  Serial1.write(frame, sbusFrameLen());
+  sbusWriteLive(frame, sbusFrameLen());
   updatePwmOutputs();
 }
 
 // HIL "glitch": the one malformed burst a test asked for, in place of this slot's
 // frame. loop() sends it whether or not the stream is on, so a test can stop the
 // stream, inject the burst alone and then let exactly k good frames through
-// ("stream" with "frames"). Only loop() writes Serial1: a verb that arrives over
-// the WebSocket runs on the async task, which would interleave with a frame.
+// ("stream" with "frames"). Only loop() writes the outputs: a verb that arrives over
+// the WebSocket runs on the async task, which would interleave with a frame. It goes to
+// the routed outputs (sbusWriteLive), as every frame of the controls does.
 static void sendGlitch() {
   const uint8_t kind = g_glitchKind;
   const int     flen = sbusFrameLen();
@@ -964,21 +1003,21 @@ static void sendGlitch() {
     case GLITCH_TRUNCATE:            // the frame's first n bytes, then silence until the next slot
       buildSbusFrame(frame);
       if (n >= flen) n = flen - 1;   // the mode changed since the verb: still a partial frame
-      Serial1.write(frame, n);
+      sbusWriteLive(frame, n);
       break;
     case GLITCH_GARBAGE:             // n bytes that hold no header, so no frame can start in them
-      Serial1.write(g_glitchBuf, n);
+      sbusWriteLive(g_glitchBuf, n);
       break;
     case GLITCH_DOUBLE:              // n whole frames back to back, no gap between them
       buildSbusFrame(frame);
-      for (int k = 0; k < n; k++) Serial1.write(frame, flen);
+      for (int k = 0; k < n; k++) sbusWriteLive(frame, flen);
       break;
     case GLITCH_GAP:                 // the frame in two halves, n ms of silence between them
       buildSbusFrame(frame);
-      Serial1.write(frame, flen / 2);
-      Serial1.flush();               // the first half is on the wire before the silence starts
+      sbusWriteLive(frame, flen / 2);
+      sbusFlushLive();               // the first half is on the wire before the silence starts
       delay(n);
-      Serial1.write(frame + flen / 2, flen - flen / 2);
+      sbusWriteLive(frame + flen / 2, flen - flen / 2);
       break;
     case GLITCH_DIP: {               // one whole frame with channel n at 992; the next as before
       const uint16_t keep = sbusChannels[n - 1];
@@ -1064,13 +1103,18 @@ static String buildBootLogJson();   // defined with the boot telemetry, further 
 // Never gated on the ping window: an image without the verbs stays silent (an
 // unknown "t" falls through processCommandJson), and that silence is how the
 // harness tells the two apart. `extra` is appended inside the object: ,"k":v.
+static const char* routeName() {
+  const uint8_t r = g_route;
+  return r == (ROUTE_A | ROUTE_B) ? "both" : r == ROUTE_B ? "kyber" : "navicore";
+}
+
 static void sendTestReply(const char* verb, bool ok, AsyncWebSocketClient* wsClient, const char* extra = "") {
   char buf[320];
   const int n = snprintf(buf, sizeof(buf),
     "{\"e\":\"test\",\"t\":\"%s\",\"ok\":%s,\"flags\":%u,\"stream\":%s,\"budget\":%ld,"
-    "\"sbus24\":%s,\"saved24\":%s%s}",
+    "\"sbus24\":%s,\"saved24\":%s,\"route\":\"%s\"%s}",
     verb, ok ? "true" : "false", (unsigned)g_sbusFlags, g_sbusStream ? "true" : "false",
-    (long)g_streamBudget, g_sbus24 ? "true" : "false", cfg.sbus24 ? "true" : "false", extra);
+    (long)g_streamBudget, g_sbus24 ? "true" : "false", cfg.sbus24 ? "true" : "false", routeName(), extra);
   if (n <= 0 || n >= (int)sizeof(buf)) return;
   if (wsClient) { wsClient->text(buf); return; }
   serialEnqueueLine(buf, (size_t)n);
@@ -1329,6 +1373,17 @@ void processCommandJson(const char* json, AsyncWebSocketClient* wsClient) {
     char extra[40];
     snprintf(extra, sizeof(extra), ",\"c\":%d,\"v\":%d", c, v);
     sendTestReply("ch", ok, wsClient, extra);
+  }
+
+  // { "t":"route", "to":"navicore"|"kyber"|"both" }   which SBUS output carries the controls: A (S5) is
+  // NaviCore's on the bench, B (S4) the Kyber's. One not routed gets no input - A its rest frame, B nothing.
+  else if (!strcmp(t, "route")) {
+    const char* to  = doc["to"] | "";
+    uint8_t     r   = !strcmp(to, "navicore") ? ROUTE_A : !strcmp(to, "kyber") ? ROUTE_B
+                    : !strcmp(to, "both") ? (uint8_t)(ROUTE_A | ROUTE_B) : 0;
+    const bool  has = to[0] != 0;
+    if (r) g_route = r;
+    sendTestReply("route", !has || r, wsClient);
   }
 
   // { "t":"glitch", "kind":k, "n":i }   one malformed burst in place of the next frame
@@ -1908,8 +1963,11 @@ void setup() {
   // SBUS output: 100 kbaud, 8E2, inverted (GPIO9 = Serial5 TX on WCB v3.x)
   Serial1.begin(SBUS_BAUD, SERIAL_8E2, -1, SBUS_TX_PIN, true);
   Serial.printf("[SBUS] SBUS TX on GPIO%d  (100kbaud 8E2 inverted)\n", SBUS_TX_PIN);
+  // Output B (GPIO17 = Serial4 TX on WCB v3.x): silent until the HIL "route" verb sends it the controls
+  Serial2.begin(SBUS_BAUD, SERIAL_8E2, -1, SBUS_B_TX_PIN, true);
+  Serial.printf("[SBUS] SBUS output B on GPIO%d  (idle until routed)\n", SBUS_B_TX_PIN);
 
-  // RC PWM outputs on GPIO4/6/15/17 (Serial1-4 TX on WCB v3.x)
+  // RC PWM outputs on GPIO4/6/15 (Serial1-3 TX on WCB v3.x); GPIO17 is output B
   initPwmOutputs();
 
   // LittleFS
@@ -1922,6 +1980,7 @@ void setup() {
   // Init runtime state after config is loaded
   initRuntimeState();
   applyAllControls();
+  memcpy(g_restChannels, sbusChannels, sizeof(g_restChannels));   // output A's frame while not routed
 
   // Start web server BEFORE WiFi (avoids AsyncTCP mutex race on ESP32 core 3.x)
   WiFi.persistent(false);
@@ -2115,6 +2174,7 @@ void loop() {
   uint32_t now = millis();
   if (now - lastFrameMs >= SBUS_FRAME_MS) {
     lastFrameMs = now;
+    if (!(g_route & ROUTE_A)) sendRestFrameA();   // HIL "route": NaviCore stays linked, at rest
     if (g_glitchKind != GLITCH_NONE) {
       sendGlitch();                  // HIL: a malformed burst takes this slot, stream on or off
     } else if (g_sbusStream) {       // HIL "stream": off stops the frames without a reset
